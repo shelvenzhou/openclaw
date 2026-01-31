@@ -11,6 +11,11 @@ import {
   VENICE_DEFAULT_MODEL_REF,
   VENICE_MODEL_CATALOG,
 } from "../agents/venice-models.js";
+import {
+  discoverRedpillModels,
+  REDPILL_BASE_URL,
+  REDPILL_DEFAULT_MODEL_REF,
+} from "../agents/redpill-models.js";
 import type { OpenClawConfig } from "../config/config.js";
 import {
   OPENROUTER_DEFAULT_MODEL_REF,
@@ -451,6 +456,86 @@ export function applyVeniceConfig(cfg: OpenClawConfig): OpenClawConfig {
               }
             : undefined),
           primary: VENICE_DEFAULT_MODEL_REF,
+        },
+      },
+    },
+  };
+}
+
+/**
+ * Apply Redpill provider configuration without changing the default model.
+ * Registers Redpill models and sets up the provider, but preserves existing model selection.
+ */
+export function applyRedpillProviderConfig(cfg: MoltbotConfig): MoltbotConfig {
+  const providers = { ...cfg.models?.providers };
+  const existingProvider = providers.redpill;
+  const existingModels = Array.isArray(existingProvider?.models) ? existingProvider.models : [];
+  const redpillModels = discoverRedpillModels();
+
+  // Add all Redpill models to the agent's model allowlist
+  const models = { ...cfg.agents?.defaults?.models };
+  for (const model of redpillModels) {
+    const modelRef = `redpill/${model.id}`;
+    if (!models[modelRef]) {
+      models[modelRef] = { alias: model.name.replace(" (GPU TEE)", "") };
+    }
+  }
+  const mergedModels = [
+    ...existingModels,
+    ...redpillModels.filter(
+      (model) => !existingModels.some((existing) => existing.id === model.id),
+    ),
+  ];
+  const { apiKey: existingApiKey, ...existingProviderRest } = (existingProvider ?? {}) as Record<
+    string,
+    unknown
+  > as { apiKey?: string };
+  const resolvedApiKey = typeof existingApiKey === "string" ? existingApiKey : undefined;
+  const normalizedApiKey = resolvedApiKey?.trim();
+  providers.redpill = {
+    ...existingProviderRest,
+    baseUrl: REDPILL_BASE_URL,
+    api: "openai-completions",
+    ...(normalizedApiKey ? { apiKey: normalizedApiKey } : {}),
+    models: mergedModels.length > 0 ? mergedModels : redpillModels,
+  };
+
+  return {
+    ...cfg,
+    agents: {
+      ...cfg.agents,
+      defaults: {
+        ...cfg.agents?.defaults,
+        models,
+      },
+    },
+    models: {
+      mode: cfg.models?.mode ?? "merge",
+      providers,
+    },
+  };
+}
+
+/**
+ * Apply Redpill provider configuration AND set Redpill as the default model.
+ * Use this when Redpill is the primary provider choice during onboarding.
+ */
+export function applyRedpillConfig(cfg: MoltbotConfig): MoltbotConfig {
+  const next = applyRedpillProviderConfig(cfg);
+  const existingModel = next.agents?.defaults?.model;
+  return {
+    ...next,
+    agents: {
+      ...next.agents,
+      defaults: {
+        ...next.agents?.defaults,
+        model: {
+          ...(existingModel && "fallbacks" in (existingModel as Record<string, unknown>)
+            ? {
+                fallbacks: (existingModel as { fallbacks?: string[] }).fallbacks,
+              }
+            : undefined),
+          primary: REDPILL_DEFAULT_MODEL_REF,
         },
       },
     },

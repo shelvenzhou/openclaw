@@ -14,6 +14,7 @@ import {
   applyMoonshotConfig,
   applyOpencodeZenConfig,
   applyOpenrouterConfig,
+  applyRedpillConfig,
   applySyntheticConfig,
   applyVeniceConfig,
   applyVercelAiGatewayConfig,
@@ -26,6 +27,7 @@ import {
   setMoonshotApiKey,
   setOpencodeZenApiKey,
   setOpenrouterApiKey,
+  setRedpillApiKey,
   setSyntheticApiKey,
   setVeniceApiKey,
   setVercelAiGatewayApiKey,
@@ -328,6 +330,25 @@ export async function applyNonInteractiveAuthChoice(params: {
       mode: "api_key",
     });
     return applyVeniceConfig(nextConfig);
+  }
+
+  if (authChoice === "redpill-api-key") {
+    const resolved = await resolveNonInteractiveApiKey({
+      provider: "redpill",
+      cfg: baseConfig,
+      flagValue: opts.redpillApiKey,
+      flagName: "--redpill-api-key",
+      envVar: "REDPILL_API_KEY",
+      runtime,
+    });
+    if (!resolved) return null;
+    if (resolved.source !== "profile") await setRedpillApiKey(resolved.key);
+    nextConfig = applyAuthProfileConfig(nextConfig, {
+      profileId: "redpill:default",
+      provider: "redpill",
+      mode: "api_key",
+    });
+    return applyRedpillConfig(nextConfig);
   }
 
   if (

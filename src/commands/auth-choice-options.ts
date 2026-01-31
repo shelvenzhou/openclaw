@@ -21,7 +21,8 @@ export type AuthChoiceGroupId =
   | "minimax"
   | "synthetic"
   | "venice"
-  | "qwen";
+  | "qwen"
+  | "redpill";
 
 export type AuthChoiceGroup = {
   value: AuthChoiceGroupId;
@@ -59,6 +60,12 @@ const AUTH_CHOICE_GROUP_DEFS: {
     label: "Qwen",
     hint: "OAuth",
     choices: ["qwen-portal"],
+  },
+  {
+    value: "redpill",
+    label: "Redpill AI",
+    hint: "GPU TEE privacy (DeepSeek, Qwen, Llama)",
+    choices: ["redpill-api-key"],
   },
   {
     value: "synthetic",

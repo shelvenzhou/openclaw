@@ -13,6 +13,7 @@ import {
   SYNTHETIC_MODEL_CATALOG,
 } from "./synthetic-models.js";
 import { discoverVeniceModels, VENICE_BASE_URL } from "./venice-models.js";
+import { discoverRedpillModels, REDPILL_BASE_URL } from "./redpill-models.js";
 
 type ModelsConfig = NonNullable<OpenClawConfig["models"]>;
 export type ProviderConfig = NonNullable<ModelsConfig["providers"]>[string];
@@ -347,6 +348,15 @@ async function buildVeniceProvider(): Promise<ProviderConfig> {
   };
 }
 
+async function buildRedpillProvider(): Promise<ProviderConfig> {
+  const models = discoverRedpillModels();
+  return {
+    baseUrl: REDPILL_BASE_URL,
+    api: "openai-completions",
+    models,
+  };
+}
+
 async function buildOllamaProvider(): Promise<ProviderConfig> {
   const models = await discoverOllamaModels();
   return {
@@ -390,6 +400,17 @@ export async function resolveImplicitProviders(params: {
     resolveApiKeyFromProfiles({ provider: "venice", store: authStore });
   if (veniceKey) {
     providers.venice = { ...(await buildVeniceProvider()), apiKey: veniceKey };
+  }
+
+  // Redpill
+  const redpillKey =
+    resolveEnvApiKeyVarName("redpill") ??
+    resolveApiKeyFromProfiles({ provider: "redpill", store: authStore });
+  if (redpillKey) {
+    providers.redpill = {
+      ...(await buildRedpillProvider()),
+      apiKey: redpillKey,
+    };
   }
 
   const qwenProfiles = listProfilesForProvider(authStore, "qwen-portal");
