@@ -85,6 +85,118 @@ describe("applyExtraParamsToAgent", () => {
     return payload;
   }
 
+  it("injects custom provider headers from models.providers config", () => {
+    const calls: Array<SimpleStreamOptions | undefined> = [];
+    const baseStreamFn: StreamFn = (_model, _context, options) => {
+      calls.push(options);
+      return {} as ReturnType<StreamFn>;
+    };
+    const agent = { streamFn: baseStreamFn };
+    const cfg = {
+      models: {
+        providers: {
+          "my-proxy": {
+            baseUrl: "https://proxy.example.com/v1",
+            headers: {
+              "x-api-key": "sk-proxy-key",
+            },
+            models: [],
+          },
+        },
+      },
+    };
+
+    applyExtraParamsToAgent(agent, cfg, "my-proxy", "test-model");
+
+    const model = {
+      api: "openai-responses",
+      provider: "my-proxy",
+      id: "test-model",
+    } as Model<"openai-responses">;
+    const context: Context = { messages: [] };
+
+    void agent.streamFn?.(model, context, { headers: { "X-Custom": "existing" } });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.headers).toEqual({
+      "x-api-key": "sk-proxy-key",
+      "X-Custom": "existing",
+    });
+  });
+
+  it("per-request headers override custom provider headers", () => {
+    const calls: Array<SimpleStreamOptions | undefined> = [];
+    const baseStreamFn: StreamFn = (_model, _context, options) => {
+      calls.push(options);
+      return {} as ReturnType<StreamFn>;
+    };
+    const agent = { streamFn: baseStreamFn };
+    const cfg = {
+      models: {
+        providers: {
+          "my-proxy": {
+            baseUrl: "https://proxy.example.com/v1",
+            headers: {
+              "x-api-key": "from-config",
+              "x-extra": "config-value",
+            },
+            models: [],
+          },
+        },
+      },
+    };
+
+    applyExtraParamsToAgent(agent, cfg, "my-proxy", "some-model");
+
+    const model = {
+      api: "openai-responses",
+      provider: "my-proxy",
+      id: "some-model",
+    } as Model<"openai-responses">;
+    const context: Context = { messages: [] };
+
+    void agent.streamFn?.(model, context, { headers: { "x-api-key": "per-request-wins" } });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.headers).toEqual({
+      "x-api-key": "per-request-wins",
+      "x-extra": "config-value",
+    });
+  });
+
+  it("skips custom header wrapper when provider has no headers", () => {
+    const calls: Array<SimpleStreamOptions | undefined> = [];
+    const baseStreamFn: StreamFn = (_model, _context, options) => {
+      calls.push(options);
+      return {} as ReturnType<StreamFn>;
+    };
+    const agent = { streamFn: baseStreamFn };
+    const cfg = {
+      models: {
+        providers: {
+          "my-proxy": {
+            baseUrl: "https://proxy.example.com/v1",
+            models: [],
+          },
+        },
+      },
+    };
+
+    applyExtraParamsToAgent(agent, cfg, "my-proxy", "test-model");
+
+    const model = {
+      api: "openai-responses",
+      provider: "my-proxy",
+      id: "test-model",
+    } as Model<"openai-responses">;
+    const context: Context = { messages: [] };
+
+    void agent.streamFn?.(model, context, { headers: { "X-Only": "this" } });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.headers).toEqual({ "X-Only": "this" });
+  });
+
   it("adds OpenRouter attribution headers to stream options", () => {
     const calls: Array<SimpleStreamOptions | undefined> = [];
     const baseStreamFn: StreamFn = (_model, _context, options) => {

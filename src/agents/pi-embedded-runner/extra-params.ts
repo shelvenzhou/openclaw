@@ -231,6 +231,25 @@ function createAnthropicBetaHeadersWrapper(
 }
 
 /**
+ * Create a streamFn wrapper that injects custom headers from provider config.
+ * This allows any provider to specify extra HTTP headers (e.g. x-api-key for sub2api).
+ */
+function createCustomHeadersWrapper(
+  baseStreamFn: StreamFn | undefined,
+  customHeaders: Record<string, string>,
+): StreamFn {
+  const underlying = baseStreamFn ?? streamSimple;
+  return (model, context, options) =>
+    underlying(model, context, {
+      ...options,
+      headers: {
+        ...customHeaders,
+        ...options?.headers, // let per-request headers win
+      },
+    });
+}
+
+/**
  * Create a streamFn wrapper that adds OpenRouter app attribution headers.
  * These headers allow OpenClaw to appear on OpenRouter's leaderboard.
  */
@@ -317,6 +336,13 @@ export function applyExtraParamsToAgent(
       `applying Anthropic beta header for ${provider}/${modelId}: ${anthropicBetas.join(",")}`,
     );
     agent.streamFn = createAnthropicBetaHeadersWrapper(agent.streamFn, anthropicBetas);
+  }
+
+  // Inject custom headers from provider config (e.g. x-api-key for sub2api proxies).
+  const providerConfig = cfg?.models?.providers?.[provider];
+  if (providerConfig?.headers && Object.keys(providerConfig.headers).length > 0) {
+    log.debug(`applying custom provider headers for ${provider}/${modelId}`);
+    agent.streamFn = createCustomHeadersWrapper(agent.streamFn, providerConfig.headers);
   }
 
   if (provider === "openrouter") {

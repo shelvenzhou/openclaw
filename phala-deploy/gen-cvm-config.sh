@@ -7,13 +7,13 @@ set -euo pipefail
 # values (secrets, URLs, model config) derived from environment variables.
 #
 # Required env vars:
-#   MASTER_KEY        — derives gateway auth token via HKDF-SHA256
-#   MUX_BASE_URL      — external mux-server URL (e.g. https://<hash>-18891.dstack-prod.phala.network)
-#   MUX_REGISTER_KEY  — shared key for mux registration
+#   MASTER_KEY         — derives gateway auth token via HKDF-SHA256
+#   MUX_BASE_URL       — external mux-server URL (e.g. https://<hash>-18891.dstack-prod.phala.network)
+#   MUX_REGISTER_KEY   — shared key for mux registration
+#   CODEX_API_ENDPOINT — sub2api endpoint for OpenAI Codex (e.g. https://sub2api.example.com/v1)
+#   CODEX_API_KEY      — sub2api x-api-key for Codex proxy auth
 #
 # Optional env vars:
-#   MODEL_BASE_URL    — AI provider base URL (omitted from config if unset)
-#   MODEL_API_KEY     — AI provider API key (omitted from config if unset)
 #   BRAVE_SEARCH_API_KEY — Brave Search API key (web search tool, omitted if unset)
 #
 # Output: prints OPENCLAW_CONFIG_B64 to stdout (base64, no line wrapping).
@@ -21,13 +21,15 @@ set -euo pipefail
 : "${MASTER_KEY:?MASTER_KEY is required}"
 : "${MUX_BASE_URL:?MUX_BASE_URL is required}"
 : "${MUX_REGISTER_KEY:?MUX_REGISTER_KEY is required}"
+: "${CODEX_API_ENDPOINT:?CODEX_API_ENDPOINT is required}"
+: "${CODEX_API_KEY:?CODEX_API_KEY is required}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="${SCRIPT_DIR}/openclaw.template.json"
 [[ -f "$TEMPLATE" ]] || { echo "ERROR: template not found: $TEMPLATE" >&2; exit 1; }
 
 GATEWAY_PORT=18789
-MODEL_PRIMARY="openai/gpt-5.3-codex"
+MODEL_PRIMARY="openai-codex/gpt-5.3-codex"
 
 # --- Derive GATEWAY_AUTH_TOKEN from MASTER_KEY (same HKDF as entrypoint.sh) ---
 GATEWAY_AUTH_TOKEN=$(node -e "
@@ -39,6 +41,11 @@ GATEWAY_AUTH_TOKEN=$(node -e "
 # inboundUrl uses ${DSTACK_APP_ID} / ${DSTACK_GATEWAY_DOMAIN} placeholders —
 # resolved by the config loader's env-substitution (vars forwarded via docker-compose.yml)
 INBOUND_URL="https://\${DSTACK_APP_ID}-${GATEWAY_PORT}.\${DSTACK_GATEWAY_DOMAIN}/v1/mux/inbound"
+
+# Static mock JWT: satisfies pi-ai's extractAccountId (parses chatgpt_account_id
+# from JWT payload). Sub2api ignores this — real auth is via x-api-key header.
+# Payload: {"https://api.openai.com/auth":{"chatgpt_account_id":"acct_sub2api_proxy"},"exp":9999999999}
+CODEX_MOCK_JWT="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9zdWIyYXBpX3Byb3h5In0sImV4cCI6OTk5OTk5OTk5OX0.c3ViMmFwaQ"
 
 # --- Merge dynamic values into template ---
 CONFIG_JSON=$(node -e "
@@ -58,25 +65,26 @@ CONFIG_JSON=$(node -e "
     },
   };
 
-  // Model config (dynamic, primary always set; provider only if URL+key given)
+  // Model config — Codex via sub2api
   cfg.agents.defaults.model = { primary: process.argv[6] };
-  const modelBaseUrl = process.argv[7] || '';
-  const modelApiKey = process.argv[8] || '';
-  if (modelBaseUrl && modelApiKey) {
-    cfg.models = {
-      providers: {
-        openai: { baseUrl: modelBaseUrl, apiKey: modelApiKey, models: [] },
+  cfg.models = {
+    providers: {
+      'openai-codex': {
+        baseUrl: process.argv[7],
+        apiKey: process.argv[8],
+        headers: { 'x-api-key': process.argv[9] },
+        models: [],
       },
-    };
-  }
+    },
+  };
 
   // Brave Search web tool (optional)
-  const braveKey = process.argv[9] || '';
+  const braveKey = process.argv[10] || '';
   if (braveKey) {
     cfg.tools = { web: { search: { enabled: true, provider: 'brave', apiKey: braveKey } } };
   }
 
   process.stdout.write(JSON.stringify(cfg, null, 2));
-" "$TEMPLATE" "$GATEWAY_AUTH_TOKEN" "$MUX_BASE_URL" "$MUX_REGISTER_KEY" "$INBOUND_URL" "$MODEL_PRIMARY" "${MODEL_BASE_URL:-}" "${MODEL_API_KEY:-}" "${BRAVE_SEARCH_API_KEY:-}")
+" "$TEMPLATE" "$GATEWAY_AUTH_TOKEN" "$MUX_BASE_URL" "$MUX_REGISTER_KEY" "$INBOUND_URL" "$MODEL_PRIMARY" "$CODEX_API_ENDPOINT" "$CODEX_MOCK_JWT" "$CODEX_API_KEY" "${BRAVE_SEARCH_API_KEY:-}")
 
 printf '%s' "$CONFIG_JSON" | base64 -w0

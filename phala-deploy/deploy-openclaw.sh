@@ -6,12 +6,13 @@
 #
 # Secrets (via rv-exec --dotenv):
 #   MASTER_KEY REDPILL_API_KEY S3_BUCKET S3_ENDPOINT S3_PROVIDER S3_REGION
-#   AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+#   AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY CODEX_API_KEY CODEX_API_ENDPOINT
 # Also needs MUX_REGISTER_KEY for gen-cvm-config.sh (via rv-exec).
 #
 # Usage:
 #   rv-exec MASTER_KEY REDPILL_API_KEY S3_BUCKET S3_ENDPOINT S3_PROVIDER S3_REGION \
 #     AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY MUX_REGISTER_KEY \
+#     CODEX_API_ENDPOINT CODEX_API_KEY \
 #     -- bash phala-deploy/deploy-openclaw.sh
 #
 #   bash phala-deploy/deploy-openclaw.sh --dry-run
@@ -123,7 +124,7 @@ generate_openclaw_config() {
     return 0
   fi
 
-  rv-exec MASTER_KEY MUX_REGISTER_KEY -- bash -lc '
+  rv-exec MASTER_KEY MUX_REGISTER_KEY CODEX_API_ENDPOINT CODEX_API_KEY -- bash -lc '
     export MUX_BASE_URL="'"$MUX_BASE_URL"'"
     cfg=$("'"$SCRIPT_DIR"'/gen-cvm-config.sh")
     echo "OPENCLAW_CONFIG_B64=${cfg}" >> "'"$env_file"'"
