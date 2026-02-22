@@ -12,6 +12,7 @@ import {
   listEnabledTelegramAccounts,
 } from "../../../telegram/accounts.js";
 import { isTelegramInlineButtonsEnabled } from "../../../telegram/inline-buttons.js";
+import { isMuxEnabled } from "../outbound/mux.js";
 import type { ChannelMessageActionAdapter, ChannelMessageActionName } from "../types.js";
 
 const providerId = "telegram";
@@ -44,7 +45,9 @@ function readTelegramSendParams(params: Record<string, unknown>) {
 export const telegramMessageActions: ChannelMessageActionAdapter = {
   listActions: ({ cfg }) => {
     const accounts = listEnabledTelegramAccounts(cfg).filter(
-      (account) => account.tokenSource !== "none",
+      (account) =>
+        account.tokenSource !== "none" ||
+        isMuxEnabled({ cfg, channel: "telegram", accountId: account.accountId }),
     );
     if (accounts.length === 0) {
       return [];
@@ -76,7 +79,9 @@ export const telegramMessageActions: ChannelMessageActionAdapter = {
   },
   supportsButtons: ({ cfg }) => {
     const accounts = listEnabledTelegramAccounts(cfg).filter(
-      (account) => account.tokenSource !== "none",
+      (account) =>
+        account.tokenSource !== "none" ||
+        isMuxEnabled({ cfg, channel: "telegram", accountId: account.accountId }),
     );
     if (accounts.length === 0) {
       return false;
@@ -88,7 +93,7 @@ export const telegramMessageActions: ChannelMessageActionAdapter = {
   extractToolSend: ({ args }) => {
     return extractToolSend(args, "sendMessage");
   },
-  handleAction: async ({ action, params, cfg, accountId }) => {
+  handleAction: async ({ action, params, cfg, accountId, sessionKey }) => {
     if (action === "send") {
       const sendParams = readTelegramSendParams(params);
       return await handleTelegramAction(
@@ -96,6 +101,7 @@ export const telegramMessageActions: ChannelMessageActionAdapter = {
           action: "sendMessage",
           ...sendParams,
           accountId: accountId ?? undefined,
+          sessionKey,
         },
         cfg,
       );
@@ -118,6 +124,7 @@ export const telegramMessageActions: ChannelMessageActionAdapter = {
           emoji,
           remove,
           accountId: accountId ?? undefined,
+          sessionKey,
         },
         cfg,
       );
@@ -138,6 +145,7 @@ export const telegramMessageActions: ChannelMessageActionAdapter = {
           chatId,
           messageId,
           accountId: accountId ?? undefined,
+          sessionKey,
         },
         cfg,
       );
@@ -162,6 +170,7 @@ export const telegramMessageActions: ChannelMessageActionAdapter = {
           content: message,
           buttons,
           accountId: accountId ?? undefined,
+          sessionKey,
         },
         cfg,
       );
@@ -183,6 +192,7 @@ export const telegramMessageActions: ChannelMessageActionAdapter = {
           replyToMessageId: replyToMessageId ?? undefined,
           messageThreadId: messageThreadId ?? undefined,
           accountId: accountId ?? undefined,
+          sessionKey,
         },
         cfg,
       );
@@ -197,6 +207,7 @@ export const telegramMessageActions: ChannelMessageActionAdapter = {
           query,
           limit: limit ?? undefined,
           accountId: accountId ?? undefined,
+          sessionKey,
         },
         cfg,
       );
@@ -218,6 +229,7 @@ export const telegramMessageActions: ChannelMessageActionAdapter = {
           iconColor: iconColor ?? undefined,
           iconCustomEmojiId: iconCustomEmojiId ?? undefined,
           accountId: accountId ?? undefined,
+          sessionKey,
         },
         cfg,
       );

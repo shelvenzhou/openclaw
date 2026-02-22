@@ -1,4 +1,5 @@
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import { isMuxEnabled } from "../../channels/plugins/outbound/mux.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { createTelegramActionGate } from "../../telegram/accounts.js";
 import type { TelegramButtonStyle, TelegramInlineButtons } from "../../telegram/button-types.js";
@@ -14,6 +15,7 @@ import {
   reactMessageTelegram,
   sendMessageTelegram,
   sendStickerTelegram,
+  type MuxTransportOpts,
 } from "../../telegram/send.js";
 import { getCacheStats, searchStickers } from "../../telegram/sticker-cache.js";
 import { resolveTelegramToken } from "../../telegram/token.js";
@@ -88,7 +90,29 @@ export async function handleTelegramAction(
 ): Promise<AgentToolResult<unknown>> {
   const action = readStringParam(params, "action", { required: true });
   const accountId = readStringParam(params, "accountId");
+  const sessionKey = readStringParam(params, "sessionKey");
   const isActionEnabled = createTelegramActionGate({ cfg, accountId });
+
+  const mux: MuxTransportOpts | undefined = isMuxEnabled({
+    cfg,
+    channel: "telegram",
+    accountId: accountId ?? undefined,
+  })
+    ? { cfg, sessionKey: sessionKey ?? "" }
+    : undefined;
+
+  const requireToken = () => {
+    if (mux) {
+      return undefined;
+    }
+    const token = resolveTelegramToken(cfg, { accountId }).token;
+    if (!token) {
+      throw new Error(
+        "Telegram bot token missing. Set TELEGRAM_BOT_TOKEN or channels.telegram.botToken.",
+      );
+    }
+    return token;
+  };
 
   if (action === "react") {
     // Check reaction level first
@@ -116,16 +140,12 @@ export async function handleTelegramAction(
     const { emoji, remove, isEmpty } = readReactionParams(params, {
       removeErrorMessage: "Emoji is required to remove a Telegram reaction.",
     });
-    const token = resolveTelegramToken(cfg, { accountId }).token;
-    if (!token) {
-      throw new Error(
-        "Telegram bot token missing. Set TELEGRAM_BOT_TOKEN or channels.telegram.botToken.",
-      );
-    }
+    const token = requireToken();
     const reactionResult = await reactMessageTelegram(chatId ?? "", messageId ?? 0, emoji ?? "", {
       token,
       remove,
       accountId: accountId ?? undefined,
+      mux,
     });
     if (!reactionResult.ok) {
       return jsonResult({
@@ -188,12 +208,7 @@ export async function handleTelegramAction(
       integer: true,
     });
     const quoteText = readStringParam(params, "quoteText");
-    const token = resolveTelegramToken(cfg, { accountId }).token;
-    if (!token) {
-      throw new Error(
-        "Telegram bot token missing. Set TELEGRAM_BOT_TOKEN or channels.telegram.botToken.",
-      );
-    }
+    const token = requireToken();
     const result = await sendMessageTelegram(to, content, {
       token,
       accountId: accountId ?? undefined,
@@ -204,6 +219,7 @@ export async function handleTelegramAction(
       quoteText: quoteText ?? undefined,
       asVoice: typeof params.asVoice === "boolean" ? params.asVoice : undefined,
       silent: typeof params.silent === "boolean" ? params.silent : undefined,
+      mux,
     });
     return jsonResult({
       ok: true,
@@ -223,15 +239,11 @@ export async function handleTelegramAction(
       required: true,
       integer: true,
     });
-    const token = resolveTelegramToken(cfg, { accountId }).token;
-    if (!token) {
-      throw new Error(
-        "Telegram bot token missing. Set TELEGRAM_BOT_TOKEN or channels.telegram.botToken.",
-      );
-    }
+    const token = requireToken();
     await deleteMessageTelegram(chatId ?? "", messageId ?? 0, {
       token,
       accountId: accountId ?? undefined,
+      mux,
     });
     return jsonResult({ ok: true, deleted: true });
   }
@@ -263,16 +275,12 @@ export async function handleTelegramAction(
         );
       }
     }
-    const token = resolveTelegramToken(cfg, { accountId }).token;
-    if (!token) {
-      throw new Error(
-        "Telegram bot token missing. Set TELEGRAM_BOT_TOKEN or channels.telegram.botToken.",
-      );
-    }
+    const token = requireToken();
     const result = await editMessageTelegram(chatId ?? "", messageId ?? 0, content, {
       token,
       accountId: accountId ?? undefined,
       buttons,
+      mux,
     });
     return jsonResult({
       ok: true,
@@ -295,17 +303,13 @@ export async function handleTelegramAction(
     const messageThreadId = readNumberParam(params, "messageThreadId", {
       integer: true,
     });
-    const token = resolveTelegramToken(cfg, { accountId }).token;
-    if (!token) {
-      throw new Error(
-        "Telegram bot token missing. Set TELEGRAM_BOT_TOKEN or channels.telegram.botToken.",
-      );
-    }
+    const token = requireToken();
     const result = await sendStickerTelegram(to, fileId, {
       token,
       accountId: accountId ?? undefined,
       replyToMessageId: replyToMessageId ?? undefined,
       messageThreadId: messageThreadId ?? undefined,
+      mux,
     });
     return jsonResult({
       ok: true,
@@ -350,17 +354,13 @@ export async function handleTelegramAction(
     const name = readStringParam(params, "name", { required: true });
     const iconColor = readNumberParam(params, "iconColor", { integer: true });
     const iconCustomEmojiId = readStringParam(params, "iconCustomEmojiId");
-    const token = resolveTelegramToken(cfg, { accountId }).token;
-    if (!token) {
-      throw new Error(
-        "Telegram bot token missing. Set TELEGRAM_BOT_TOKEN or channels.telegram.botToken.",
-      );
-    }
+    const token = requireToken();
     const result = await createForumTopicTelegram(chatId ?? "", name, {
       token,
       accountId: accountId ?? undefined,
       iconColor: iconColor ?? undefined,
       iconCustomEmojiId: iconCustomEmojiId ?? undefined,
+      mux,
     });
     return jsonResult({
       ok: true,

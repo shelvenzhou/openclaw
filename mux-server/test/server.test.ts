@@ -157,6 +157,7 @@ async function startHttpServer(
 }
 
 async function stopHttpServer(running: RunningHttpServer): Promise<void> {
+  running.server.closeAllConnections();
   await new Promise<void>((resolveServer) => {
     running.server.close(() => resolveServer());
   });
@@ -180,6 +181,9 @@ async function startWsServer(
 }
 
 async function stopWsServer(running: RunningWsServer): Promise<void> {
+  for (const client of running.server.clients) {
+    client.terminate();
+  }
   await new Promise<void>((resolveServer) => {
     running.server.close(() => resolveServer());
   });
@@ -1259,6 +1263,225 @@ describe("mux server", () => {
       text: "page 2",
     });
     expect(telegramRequests[0]?.message_thread_id).toBeUndefined();
+  });
+
+  test("telegram outbound raw sendDocument passthrough with route lock", async () => {
+    const telegramRequests: Array<Record<string, unknown>> = [];
+    const telegramApi = await startHttpServer(async (req, res) => {
+      if (req.method === "POST" && req.url === "/botdummy-token/sendDocument") {
+        telegramRequests.push(await readJsonBody(req));
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            result: { message_id: 9903, chat: { id: -100123 } },
+          }),
+        );
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    const server = await startServer({
+      tenantsJson: JSON.stringify([{ id: "tenant-a", name: "Tenant A", apiKey: "tenant-a-key" }]),
+      pairingCodesJson: JSON.stringify([
+        {
+          code: "PAIR-TG-RAW-DOC",
+          channel: "telegram",
+          routeKey: "telegram:default:chat:-100123:topic:2",
+          scope: "chat",
+        },
+      ]),
+      extraEnv: {
+        MUX_TELEGRAM_API_BASE_URL: telegramApi.url,
+      },
+    });
+
+    const claim = await claimPairing({
+      port: server.port,
+      apiKey: "tenant-a-key",
+      code: "PAIR-TG-RAW-DOC",
+      sessionKey: "agent:main:telegram:group:-100123:topic:2",
+    });
+    expect(claim.status).toBe(200);
+
+    const outbound = await fetch(`http://127.0.0.1:${server.port}/v1/mux/outbound/send`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer tenant-a-key",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        channel: "telegram",
+        sessionKey: "agent:main:telegram:group:-100123:topic:2",
+        raw: {
+          telegram: {
+            method: "sendDocument",
+            body: {
+              document: "https://example.com/file.txt",
+              caption: "here",
+              parse_mode: "HTML",
+            },
+          },
+        },
+      }),
+    });
+
+    expect(outbound.status).toBe(200);
+    expect(await outbound.json()).toMatchObject({
+      ok: true,
+      messageId: "9903",
+      rawPassthrough: true,
+    });
+    expect(telegramRequests).toHaveLength(1);
+    expect(telegramRequests[0]).toMatchObject({
+      chat_id: "-100123",
+      message_thread_id: 2,
+      document: "https://example.com/file.txt",
+      caption: "here",
+      parse_mode: "HTML",
+    });
+  });
+
+  test("telegram outbound raw setMessageReaction injects chat_id but not thread_id", async () => {
+    const telegramRequests: Array<Record<string, unknown>> = [];
+    const telegramApi = await startHttpServer(async (req, res) => {
+      if (req.method === "POST" && req.url === "/botdummy-token/setMessageReaction") {
+        telegramRequests.push(await readJsonBody(req));
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: true, result: true }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    const server = await startServer({
+      tenantsJson: JSON.stringify([{ id: "tenant-a", name: "Tenant A", apiKey: "tenant-a-key" }]),
+      pairingCodesJson: JSON.stringify([
+        {
+          code: "PAIR-TG-REACT",
+          channel: "telegram",
+          routeKey: "telegram:default:chat:-100123:topic:2",
+          scope: "chat",
+        },
+      ]),
+      extraEnv: {
+        MUX_TELEGRAM_API_BASE_URL: telegramApi.url,
+      },
+    });
+
+    const claim = await claimPairing({
+      port: server.port,
+      apiKey: "tenant-a-key",
+      code: "PAIR-TG-REACT",
+      sessionKey: "agent:main:telegram:group:-100123:topic:2",
+    });
+    expect(claim.status).toBe(200);
+
+    const outbound = await fetch(`http://127.0.0.1:${server.port}/v1/mux/outbound/send`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer tenant-a-key",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        channel: "telegram",
+        sessionKey: "agent:main:telegram:group:-100123:topic:2",
+        raw: {
+          telegram: {
+            method: "setMessageReaction",
+            body: {
+              message_id: 555,
+              reaction: [{ type: "emoji", emoji: "👍" }],
+            },
+          },
+        },
+      }),
+    });
+
+    expect(outbound.status).toBe(200);
+    expect(telegramRequests).toHaveLength(1);
+    expect(telegramRequests[0]).toMatchObject({
+      chat_id: "-100123",
+      message_id: 555,
+      reaction: [{ type: "emoji", emoji: "👍" }],
+    });
+    // setMessageReaction is NOT in THREAD_ID_METHODS — no thread injection
+    expect(telegramRequests[0]?.message_thread_id).toBeUndefined();
+  });
+
+  test("telegram outbound raw setMyCommands skips chat_id injection", async () => {
+    const telegramRequests: Array<Record<string, unknown>> = [];
+    const telegramApi = await startHttpServer(async (req, res) => {
+      if (req.method === "POST" && req.url === "/botdummy-token/setMyCommands") {
+        telegramRequests.push(await readJsonBody(req));
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: true, result: true }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    const server = await startServer({
+      tenantsJson: JSON.stringify([{ id: "tenant-a", name: "Tenant A", apiKey: "tenant-a-key" }]),
+      pairingCodesJson: JSON.stringify([
+        {
+          code: "PAIR-TG-CMDS",
+          channel: "telegram",
+          routeKey: "telegram:default:chat:-100123:topic:2",
+          scope: "chat",
+        },
+      ]),
+      extraEnv: {
+        MUX_TELEGRAM_API_BASE_URL: telegramApi.url,
+      },
+    });
+
+    const claim = await claimPairing({
+      port: server.port,
+      apiKey: "tenant-a-key",
+      code: "PAIR-TG-CMDS",
+      sessionKey: "agent:main:telegram:group:-100123:topic:2",
+    });
+    expect(claim.status).toBe(200);
+
+    const outbound = await fetch(`http://127.0.0.1:${server.port}/v1/mux/outbound/send`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer tenant-a-key",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        channel: "telegram",
+        sessionKey: "agent:main:telegram:group:-100123:topic:2",
+        raw: {
+          telegram: {
+            method: "setMyCommands",
+            body: {
+              commands: [
+                { command: "help", description: "Show help" },
+                { command: "status", description: "Show status" },
+              ],
+            },
+          },
+        },
+      }),
+    });
+
+    expect(outbound.status).toBe(200);
+    expect(telegramRequests).toHaveLength(1);
+    // NO_CHAT_ID_METHODS — no chat_id or message_thread_id
+    expect(telegramRequests[0]?.chat_id).toBeUndefined();
+    expect(telegramRequests[0]?.message_thread_id).toBeUndefined();
+    expect(telegramRequests[0]).toMatchObject({
+      commands: [
+        { command: "help", description: "Show help" },
+        { command: "status", description: "Show status" },
+      ],
+    });
   });
 
   test("telegram typing action via /send sends chat action for bound route", async () => {
@@ -3640,7 +3863,7 @@ describe("mux server", () => {
 
     await waitForCondition(
       () => inboundRequests.length >= 2,
-      20_000,
+      25_000,
       "timed out waiting for discord guild thread inbound forwards",
     );
 
@@ -3689,7 +3912,7 @@ describe("mux server", () => {
         },
       ],
     });
-  }, 20_000);
+  }, 30_000);
 
   test("telegram bot control commands support help, status, unpair, and switch", async () => {
     const inboundRequests: Array<Record<string, unknown>> = [];

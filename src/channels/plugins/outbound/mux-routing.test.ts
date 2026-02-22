@@ -69,26 +69,10 @@ function resolveFetchUrl(input: string | URL | Request): string {
 
 describe("mux outbound routing", () => {
   it("routes telegram outbound through mux when enabled", async () => {
-    const fetchSpy = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      const url = resolveFetchUrl(input);
-      if (url === "http://mux.local/v1/instances/register") {
-        expect(init?.headers).toEqual(
-          expect.objectContaining({ Authorization: `Bearer ${REGISTER_KEY}` }),
-        );
-        return jsonResponse({
-          ok: true,
-          runtimeToken: RUNTIME_TOKEN,
-          expiresAtMs: Date.now() + 24 * 60 * 60 * 1000,
-        });
-      }
-      if (url === "http://mux.local/v1/mux/outbound/send") {
-        return jsonResponse({ messageId: "mx-tg-1", chatId: "tg-chat-1" });
-      }
-      throw new Error(`unexpected url ${url}`);
+    const sendTelegram = vi.fn().mockResolvedValue({
+      messageId: "mx-tg-1",
+      chatId: "tg-chat-1",
     });
-    globalThis.fetch = fetchSpy as unknown as typeof fetch;
-
-    const sendTelegram = vi.fn();
     const cfg = {
       ...gatewayMuxConfig(),
       channels: {
@@ -108,31 +92,20 @@ describe("mux outbound routing", () => {
       deps: { sendTelegram },
     });
 
-    expect(sendTelegram).not.toHaveBeenCalled();
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    // With transport abstraction, the adapter now calls sendTelegram with mux opts
+    // instead of bypassing it with direct sendViaMux calls.
+    expect(sendTelegram).toHaveBeenCalledOnce();
+    expect(sendTelegram).toHaveBeenCalledWith(
+      "telegram:123",
+      "hello",
+      expect.objectContaining({
+        mux: { cfg, sessionKey: "sess-tg" },
+      }),
+    );
     expect(result).toMatchObject({
       channel: "telegram",
       messageId: "mx-tg-1",
       chatId: "tg-chat-1",
-    });
-
-    const sendCall = fetchSpy.mock.calls.find(
-      ([callInput]) => resolveFetchUrl(callInput) === "http://mux.local/v1/mux/outbound/send",
-    );
-    expect(sendCall).toBeDefined();
-    const [url, init] = sendCall as [string | URL | Request, RequestInit];
-    expect(resolveFetchUrl(url)).toBe("http://mux.local/v1/mux/outbound/send");
-    expect(init.headers).toEqual(
-      expect.objectContaining({
-        Authorization: `Bearer ${RUNTIME_TOKEN}`,
-        "X-OpenClaw-Id": "openclaw-instance-1",
-      }),
-    );
-    expect(parseJsonRequestBody(init)).toMatchObject({
-      channel: "telegram",
-      sessionKey: "sess-tg",
-      to: "telegram:123",
-      text: "hello",
     });
   });
 

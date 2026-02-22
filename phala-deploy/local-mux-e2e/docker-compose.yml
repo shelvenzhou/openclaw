@@ -52,6 +52,8 @@ services:
       MUX_TELEGRAM_INBOUND_MEDIA_MAX_BYTES: "5000000"
       MUX_DISCORD_INBOUND_MEDIA_MAX_BYTES: "5000000"
       MUX_WHATSAPP_INBOUND_MEDIA_MAX_BYTES: "5000000"
+      # Public URL reachable from openclaw container (docker-compose service name).
+      MUX_PUBLIC_URL: http://mux-server:18891
     volumes:
       - ../../:/workspace:ro
       - mux_data:/data

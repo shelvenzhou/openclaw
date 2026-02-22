@@ -5,6 +5,16 @@ import type {
   ReactionTypeEmoji,
 } from "@grammyjs/types";
 import { type ApiClientOptions, Bot, HttpError, InputFile } from "grammy";
+import {
+  buildTelegramRawCreateForumTopic,
+  buildTelegramRawDeleteMessage,
+  buildTelegramRawEditMessageText,
+  buildTelegramRawSend,
+  buildTelegramRawSendMedia,
+  buildTelegramRawSendPoll,
+  buildTelegramRawSetMessageReaction,
+} from "../channels/plugins/mux-envelope.js";
+import { sendViaMux } from "../channels/plugins/outbound/mux.js";
 import { loadConfig } from "../config/config.js";
 import { resolveMarkdownTableMode } from "../config/markdown-tables.js";
 import { logVerbose } from "../globals.js";
@@ -35,6 +45,12 @@ import { resolveTelegramVoiceSend } from "./voice.js";
 type TelegramApi = Bot["api"];
 type TelegramApiOverride = Partial<TelegramApi>;
 
+export type MuxTransportOpts = {
+  cfg: ReturnType<typeof loadConfig>;
+  sessionKey: string;
+  accountId?: string;
+};
+
 type TelegramSendOpts = {
   token?: string;
   accountId?: string;
@@ -60,6 +76,8 @@ type TelegramSendOpts = {
   messageThreadId?: number;
   /** Inline keyboard buttons (reply markup). */
   buttons?: TelegramInlineButtons;
+  /** When set, send via mux transport instead of direct grammY API. */
+  mux?: MuxTransportOpts;
 };
 
 type TelegramSendResult = {
@@ -79,6 +97,8 @@ type TelegramReactionOpts = {
   remove?: boolean;
   verbose?: boolean;
   retry?: RetryConfig;
+  /** When set, send via mux transport instead of direct grammY API. */
+  mux?: MuxTransportOpts;
 };
 
 const PARSE_ERR_RE = /can't parse entities|parse entities|find end of the entity/i;
@@ -426,11 +446,163 @@ export function buildInlineKeyboard(
   return { inline_keyboard: rows };
 }
 
+function mediaSenderLabelToMethod(label: string): string {
+  const map: Record<string, string> = {
+    photo: "sendPhoto",
+    animation: "sendAnimation",
+    video: "sendVideo",
+    video_note: "sendVideoNote",
+    voice: "sendVoice",
+    audio: "sendAudio",
+    document: "sendDocument",
+  };
+  return map[label] ?? "sendDocument";
+}
+
+async function sendMessageTelegramViaMux(
+  to: string,
+  text: string,
+  opts: TelegramSendOpts & { mux: MuxTransportOpts },
+): Promise<TelegramSendResult> {
+  const cfg = opts.mux.cfg;
+  const target = parseTelegramTarget(to);
+  const chatId = normalizeChatId(target.chatId);
+  const mediaUrl = opts.mediaUrl?.trim();
+  const accountId = opts.mux.accountId ?? opts.accountId;
+
+  const threadParams = buildTelegramThreadReplyParams({
+    targetMessageThreadId: target.messageThreadId,
+    messageThreadId: opts.messageThreadId,
+    chatType: target.chatType,
+    replyToMessageId: opts.replyToMessageId,
+    quoteText: opts.quoteText,
+  });
+  const messageThreadId = (threadParams.message_thread_id as number | undefined) ?? undefined;
+  const replyToMessageId = (threadParams.reply_to_message_id as number | undefined) ?? undefined;
+
+  const textMode = opts.textMode ?? "markdown";
+  const resolvedAccountId = opts.accountId ?? accountId;
+  const tableMode = resolveMarkdownTableMode({
+    cfg,
+    channel: "telegram",
+    accountId: resolvedAccountId,
+  });
+  const renderHtmlText = (value: string) => renderTelegramHtmlText(value, { textMode, tableMode });
+
+  const muxSend = async (raw: Record<string, unknown>) => {
+    return await sendViaMux({
+      cfg,
+      channel: "telegram",
+      sessionKey: opts.mux.sessionKey,
+      accountId,
+      raw: { telegram: raw },
+    });
+  };
+
+  if (mediaUrl) {
+    const media = await loadWebMedia(mediaUrl, {
+      maxBytes: opts.maxBytes,
+      localRoots: opts.mediaLocalRoots,
+    });
+    const kind = mediaKindFromMime(media.contentType ?? undefined);
+    const isGif = isGifMedia({
+      contentType: media.contentType,
+      fileName: media.fileName,
+    });
+    const isVideoNote = kind === "video" && opts.asVideoNote === true;
+
+    let caption: string | undefined;
+    let followUpText: string | undefined;
+    if (isVideoNote) {
+      caption = undefined;
+      followUpText = text.trim() ? text : undefined;
+    } else {
+      const split = splitTelegramCaption(text);
+      caption = split.caption;
+      followUpText = split.followUpText;
+    }
+    const needsSeparateText = Boolean(followUpText);
+
+    // Determine Telegram method using the same logic as the direct path.
+    let label: string;
+    if (isGif) {
+      label = "animation";
+    } else if (kind === "image") {
+      label = "photo";
+    } else if (kind === "video") {
+      label = isVideoNote ? "video_note" : "video";
+    } else if (kind === "audio") {
+      const { useVoice } = resolveTelegramVoiceSend({
+        wantsVoice: opts.asVoice === true,
+        contentType: media.contentType,
+        fileName: media.fileName ?? inferFilename(kind) ?? "file",
+        logFallback: logVerbose,
+      });
+      label = useVoice ? "voice" : "audio";
+    } else {
+      label = "document";
+    }
+
+    const methodName = mediaSenderLabelToMethod(label);
+    const htmlCaption = caption ? renderHtmlText(caption) : undefined;
+    // For local files (non-HTTP paths), include file content as base64 so the
+    // mux-server can upload via multipart form data.  For HTTP URLs, Telegram
+    // downloads the file directly.
+    const isLocalMedia = !/^https?:\/\//i.test(mediaUrl);
+    const raw = buildTelegramRawSendMedia({
+      method: methodName,
+      mediaUrl,
+      fileBase64: isLocalMedia ? media.buffer.toString("base64") : undefined,
+      fileName: isLocalMedia ? (media.fileName ?? undefined) : undefined,
+      caption: htmlCaption,
+      messageThreadId,
+      replyToMessageId,
+      buttons: !needsSeparateText ? opts.buttons : undefined,
+    });
+    const result = await muxSend(raw);
+
+    if (needsSeparateText && followUpText) {
+      const textRaw = buildTelegramRawSend({
+        to: chatId,
+        text: renderHtmlText(followUpText),
+        messageThreadId,
+        buttons: opts.buttons,
+      });
+      await muxSend(textRaw);
+    }
+
+    return { messageId: String(result.messageId ?? "unknown"), chatId };
+  }
+
+  if (!text || !text.trim()) {
+    throw new Error("Message must be non-empty for Telegram sends");
+  }
+
+  const raw = buildTelegramRawSend({
+    to: chatId,
+    text: renderHtmlText(text),
+    messageThreadId,
+    replyToMessageId,
+    quoteText: opts.quoteText,
+    buttons: opts.buttons,
+  });
+  const result = await muxSend(raw);
+  return { messageId: String(result.messageId ?? "unknown"), chatId };
+}
+
 export async function sendMessageTelegram(
   to: string,
   text: string,
   opts: TelegramSendOpts = {},
 ): Promise<TelegramSendResult> {
+  if (opts.mux) {
+    return sendMessageTelegramViaMux(
+      to,
+      text,
+      opts as TelegramSendOpts & { mux: MuxTransportOpts },
+    );
+  }
+
   const { cfg, account, api } = resolveTelegramApiContext(opts);
   const target = parseTelegramTarget(to);
   const chatId = normalizeChatId(target.chatId);
@@ -720,6 +892,23 @@ export async function reactMessageTelegram(
   emoji: string,
   opts: TelegramReactionOpts = {},
 ): Promise<{ ok: true } | { ok: false; warning: string }> {
+  if (opts.mux) {
+    const messageId = normalizeMessageId(messageIdInput);
+    const raw = buildTelegramRawSetMessageReaction({
+      messageId,
+      emoji: emoji.trim(),
+      remove: opts.remove,
+    });
+    await sendViaMux({
+      cfg: opts.mux.cfg,
+      channel: "telegram",
+      sessionKey: opts.mux.sessionKey,
+      accountId: opts.mux.accountId ?? opts.accountId,
+      raw: { telegram: raw },
+    });
+    return { ok: true };
+  }
+
   const { cfg, account, api } = resolveTelegramApiContext(opts);
   const chatId = normalizeChatId(String(chatIdInput));
   const messageId = normalizeMessageId(messageIdInput);
@@ -759,6 +948,8 @@ type TelegramDeleteOpts = {
   verbose?: boolean;
   api?: TelegramApiOverride;
   retry?: RetryConfig;
+  /** When set, send via mux transport instead of direct grammY API. */
+  mux?: MuxTransportOpts;
 };
 
 export async function deleteMessageTelegram(
@@ -766,6 +957,19 @@ export async function deleteMessageTelegram(
   messageIdInput: string | number,
   opts: TelegramDeleteOpts = {},
 ): Promise<{ ok: true }> {
+  if (opts.mux) {
+    const messageId = normalizeMessageId(messageIdInput);
+    const raw = buildTelegramRawDeleteMessage({ messageId });
+    await sendViaMux({
+      cfg: opts.mux.cfg,
+      channel: "telegram",
+      sessionKey: opts.mux.sessionKey,
+      accountId: opts.mux.accountId ?? opts.accountId,
+      raw: { telegram: raw },
+    });
+    return { ok: true };
+  }
+
   const { cfg, account, api } = resolveTelegramApiContext(opts);
   const chatId = normalizeChatId(String(chatIdInput));
   const messageId = normalizeMessageId(messageIdInput);
@@ -794,6 +998,8 @@ type TelegramEditOpts = {
   buttons?: TelegramInlineButtons;
   /** Optional config injection to avoid global loadConfig() (improves testability). */
   cfg?: ReturnType<typeof loadConfig>;
+  /** When set, send via mux transport instead of direct grammY API. */
+  mux?: MuxTransportOpts;
 };
 
 export async function editMessageTelegram(
@@ -802,6 +1008,32 @@ export async function editMessageTelegram(
   text: string,
   opts: TelegramEditOpts = {},
 ): Promise<{ ok: true; messageId: string; chatId: string }> {
+  if (opts.mux) {
+    const chatId = normalizeChatId(String(chatIdInput));
+    const messageId = normalizeMessageId(messageIdInput);
+    const muxCfg = opts.mux.cfg;
+    const textMode = opts.textMode ?? "markdown";
+    const tableMode = resolveMarkdownTableMode({
+      cfg: muxCfg,
+      channel: "telegram",
+      accountId: opts.accountId,
+    });
+    const htmlText = renderTelegramHtmlText(text, { textMode, tableMode });
+    const raw = buildTelegramRawEditMessageText({
+      messageId,
+      text: htmlText,
+      parseMode: "HTML",
+    });
+    await sendViaMux({
+      cfg: muxCfg,
+      channel: "telegram",
+      sessionKey: opts.mux.sessionKey,
+      accountId: opts.mux.accountId ?? opts.accountId,
+      raw: { telegram: raw },
+    });
+    return { ok: true, messageId: String(messageId), chatId };
+  }
+
   const { cfg, account, api } = resolveTelegramApiContext({
     ...opts,
     cfg: opts.cfg,
@@ -908,6 +1140,8 @@ type TelegramStickerOpts = {
   replyToMessageId?: number;
   /** Forum topic thread ID (for forum supergroups) */
   messageThreadId?: number;
+  /** When set, send via mux transport instead of direct grammY API. */
+  mux?: MuxTransportOpts;
 };
 
 /**
@@ -923,6 +1157,31 @@ export async function sendStickerTelegram(
 ): Promise<TelegramSendResult> {
   if (!fileId?.trim()) {
     throw new Error("Telegram sticker file_id is required");
+  }
+
+  if (opts.mux) {
+    const target = parseTelegramTarget(to);
+    const chatId = normalizeChatId(target.chatId);
+    const threadParams = buildTelegramThreadReplyParams({
+      targetMessageThreadId: target.messageThreadId,
+      messageThreadId: opts.messageThreadId,
+      chatType: target.chatType,
+      replyToMessageId: opts.replyToMessageId,
+    });
+    const raw = buildTelegramRawSendMedia({
+      method: "sendSticker",
+      mediaUrl: fileId.trim(),
+      messageThreadId: threadParams.message_thread_id as number | undefined,
+      replyToMessageId: threadParams.reply_to_message_id as number | undefined,
+    });
+    const result = await sendViaMux({
+      cfg: opts.mux.cfg,
+      channel: "telegram",
+      sessionKey: opts.mux.sessionKey,
+      accountId: opts.mux.accountId ?? opts.accountId,
+      raw: { telegram: raw },
+    });
+    return { messageId: String(result.messageId ?? "unknown"), chatId };
   }
 
   const { cfg, account, api } = resolveTelegramApiContext(opts);
@@ -988,6 +1247,8 @@ type TelegramPollOpts = {
   silent?: boolean;
   /** Whether votes are anonymous. Defaults to true (Telegram default). */
   isAnonymous?: boolean;
+  /** When set, send via mux transport instead of direct grammY API. */
+  mux?: MuxTransportOpts;
 };
 
 /**
@@ -1001,6 +1262,47 @@ export async function sendPollTelegram(
   poll: PollInput,
   opts: TelegramPollOpts = {},
 ): Promise<{ messageId: string; chatId: string; pollId?: string }> {
+  if (opts.mux) {
+    const target = parseTelegramTarget(to);
+    const chatId = normalizeChatId(target.chatId);
+    const normalizedPoll = normalizePollInput(poll, { maxOptions: 10 });
+
+    const durationSeconds = normalizedPoll.durationSeconds;
+    if (durationSeconds === undefined && normalizedPoll.durationHours !== undefined) {
+      throw new Error(
+        "Telegram poll durationHours is not supported. Use durationSeconds (5-600) instead.",
+      );
+    }
+    if (durationSeconds !== undefined && (durationSeconds < 5 || durationSeconds > 600)) {
+      throw new Error("Telegram poll durationSeconds must be between 5 and 600");
+    }
+
+    const threadParams = buildTelegramThreadReplyParams({
+      targetMessageThreadId: target.messageThreadId,
+      messageThreadId: opts.messageThreadId,
+      chatType: target.chatType,
+      replyToMessageId: opts.replyToMessageId,
+    });
+    const raw = buildTelegramRawSendPoll({
+      question: normalizedPoll.question,
+      options: normalizedPoll.options,
+      allowsMultipleAnswers: normalizedPoll.maxSelections > 1,
+      isAnonymous: opts.isAnonymous,
+      openPeriod: durationSeconds,
+      messageThreadId: threadParams.message_thread_id as number | undefined,
+      replyToMessageId: threadParams.reply_to_message_id as number | undefined,
+      silent: opts.silent,
+    });
+    const result = await sendViaMux({
+      cfg: opts.mux.cfg,
+      channel: "telegram",
+      sessionKey: opts.mux.sessionKey,
+      accountId: opts.mux.accountId ?? opts.accountId,
+      raw: { telegram: raw },
+    });
+    return { messageId: String(result.messageId ?? "unknown"), chatId };
+  }
+
   const { cfg, account, api } = resolveTelegramApiContext(opts);
   const target = parseTelegramTarget(to);
   const chatId = normalizeChatId(target.chatId);
@@ -1092,6 +1394,8 @@ type TelegramCreateForumTopicOpts = {
   iconColor?: number;
   /** Custom emoji ID for the topic icon. */
   iconCustomEmojiId?: string;
+  /** When set, send via mux transport instead of direct grammY API. */
+  mux?: MuxTransportOpts;
 };
 
 export type TelegramCreateForumTopicResult = {
@@ -1119,6 +1423,29 @@ export async function createForumTopicTelegram(
   const trimmedName = name.trim();
   if (trimmedName.length > 128) {
     throw new Error("Forum topic name must be 128 characters or fewer");
+  }
+
+  if (opts.mux) {
+    const raw = buildTelegramRawCreateForumTopic({
+      name: trimmedName,
+      iconColor: opts.iconColor,
+      iconCustomEmojiId: opts.iconCustomEmojiId?.trim() || undefined,
+    });
+    const target = parseTelegramTarget(chatId);
+    const normalizedChatId = normalizeChatId(target.chatId);
+    const result = await sendViaMux({
+      cfg: opts.mux.cfg,
+      channel: "telegram",
+      sessionKey: opts.mux.sessionKey,
+      accountId: opts.mux.accountId ?? opts.accountId,
+      raw: { telegram: raw },
+    });
+    const muxResult = result as Record<string, unknown>;
+    return {
+      topicId: typeof muxResult.message_thread_id === "number" ? muxResult.message_thread_id : 0,
+      name: trimmedName,
+      chatId: normalizedChatId,
+    };
   }
 
   const cfg = loadConfig();

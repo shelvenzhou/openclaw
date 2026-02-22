@@ -1,11 +1,13 @@
-import type { IncomingMessage, ServerResponse } from "node:http";
 import fs from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import type { MsgContext } from "../auto-reply/templating.js";
-import type { OpenClawConfig } from "../config/config.js";
+import { resolveAckReaction } from "../agents/identity.js";
 import { dispatchInboundMessage } from "../auto-reply/dispatch.js";
+import { dispatchReplyWithBufferedBlockDispatcher } from "../auto-reply/reply/provider-dispatcher.js";
 import { createReplyDispatcher } from "../auto-reply/reply/reply-dispatcher.js";
+import { routeReply } from "../auto-reply/reply/route-reply.js";
+import type { MsgContext } from "../auto-reply/templating.js";
 import { normalizeChannelId } from "../channels/plugins/index.js";
 import {
   asMuxRecord,
@@ -15,6 +17,7 @@ import {
   readMuxNonEmptyString,
   readMuxOptionalNumber,
   readMuxPositiveInt,
+  readTelegramMessageThreadId,
   resolveMuxThreadId,
   toMuxInboundPayload,
   type MuxInboundAttachment,
@@ -26,12 +29,26 @@ import {
   sendTypingViaMux,
   sendViaMux,
 } from "../channels/plugins/outbound/mux.js";
+import type { OpenClawConfig } from "../config/config.js";
 import { loadConfig } from "../config/config.js";
-import { warn } from "../globals.js";
+import { logVerbose, warn } from "../globals.js";
 import {
   resolveTelegramCallbackAction,
   type TelegramCallbackButtons,
 } from "../telegram/callback-actions.js";
+import {
+  cleanupDraftStream,
+  createTelegramDraftStream,
+  tryFinalizeDraftAsEdit,
+  type TelegramDraftStreamTransport,
+} from "../telegram/draft-stream.js";
+import {
+  deleteMessageTelegram,
+  editMessageTelegram,
+  reactMessageTelegram,
+  sendMessageTelegram,
+  type MuxTransportOpts,
+} from "../telegram/send.js";
 import { readJsonBody } from "./hooks.js";
 import { verifyMuxInboundJwt } from "./mux-jwt.js";
 
@@ -370,6 +387,9 @@ export async function handleMuxInboundHttpRequest(
     }
   }
 
+  // For Telegram: set Surface = channel so dispatch-from-config delivers through our
+  // callback instead of routing via routeReply (Surface matches OriginatingChannel).
+  const isTelegramStreaming = channel === "telegram";
   const ctx: MsgContext = {
     Body: inboundBody,
     BodyForAgent: inboundBody,
@@ -384,11 +404,14 @@ export async function handleMuxInboundHttpRequest(
     Timestamp: readMuxOptionalNumber(payload.timestampMs),
     ChatType: readMuxNonEmptyString(payload.chatType) ?? "direct",
     Provider: channel,
-    Surface: "mux",
+    Surface: isTelegramStreaming ? channel : "mux",
     OriginatingChannel: channel,
     OriginatingTo: originatingTo,
     MessageThreadId: resolveMuxThreadId(payload.threadId, channelData),
-    ChannelData: channelData,
+    ChannelData: {
+      ...channelData,
+      ...(isTelegramStreaming ? { inboundTransport: "mux" } : {}),
+    },
     CommandAuthorized: true,
   };
 
@@ -444,31 +467,48 @@ export async function handleMuxInboundHttpRequest(
             }
           }
         : undefined;
-      const dispatcher = createReplyDispatcher({
-        deliver: async () => {
-          // route-reply path handles outbound when OriginatingChannel differs from Surface.
-        },
-        onError: () => {
-          // route-reply errors are surfaced in dispatch flow and logs.
-        },
-      });
-      try {
-        await dispatchInboundMessage({
+
+      if (isTelegramStreaming) {
+        await dispatchMuxTelegram({
           ctx,
           cfg,
-          dispatcher,
-          replyOptions: {
-            ...(onReplyStart ? { onReplyStart } : {}),
-            onTypingController: (typing) => {
-              markDispatchIdle = () => typing.markDispatchIdle();
-            },
+          sessionKey,
+          originatingTo,
+          channelData,
+          messageId,
+          onReplyStart,
+          onMarkDispatchIdle: (fn) => {
+            markDispatchIdle = fn;
           },
         });
-        await dispatcher.waitForIdle();
-      } catch (err) {
-        warn(`mux inbound dispatch failed messageId=${messageId}: ${String(err)}`);
-      } finally {
         markDispatchIdle?.();
+      } else {
+        const dispatcher = createReplyDispatcher({
+          deliver: async () => {
+            // route-reply path handles outbound when OriginatingChannel differs from Surface.
+          },
+          onError: () => {
+            // route-reply errors are surfaced in dispatch flow and logs.
+          },
+        });
+        try {
+          await dispatchInboundMessage({
+            ctx,
+            cfg,
+            dispatcher,
+            replyOptions: {
+              ...(onReplyStart ? { onReplyStart } : {}),
+              onTypingController: (typing) => {
+                markDispatchIdle = () => typing.markDispatchIdle();
+              },
+            },
+          });
+          await dispatcher.waitForIdle();
+        } catch (err) {
+          warn(`mux inbound dispatch failed messageId=${messageId}: ${String(err)}`);
+        } finally {
+          markDispatchIdle?.();
+        }
       }
     } catch (err) {
       warn(`mux inbound attachment resolve failed messageId=${messageId}: ${String(err)}`);
@@ -490,4 +530,125 @@ export async function handleMuxInboundHttpRequest(
     eventId: readMuxNonEmptyString(payload.eventId) ?? messageId,
   });
   return true;
+}
+
+async function dispatchMuxTelegram(params: {
+  ctx: MsgContext;
+  cfg: OpenClawConfig;
+  sessionKey: string;
+  originatingTo: string;
+  channelData: Record<string, unknown> | undefined;
+  messageId: string;
+  onReplyStart?: () => Promise<void>;
+  onMarkDispatchIdle: (fn: () => void) => void;
+}): Promise<void> {
+  const { ctx, cfg, sessionKey, originatingTo, channelData, messageId, onReplyStart } = params;
+  const messageThreadId = readTelegramMessageThreadId(
+    resolveMuxThreadId(ctx.MessageThreadId, channelData),
+  );
+
+  const mux: MuxTransportOpts = { cfg, sessionKey, accountId: ctx.AccountId };
+
+  const transport: TelegramDraftStreamTransport = {
+    send: async (text) => {
+      const result = await sendMessageTelegram(originatingTo, text, {
+        textMode: "html",
+        messageThreadId,
+        mux,
+      });
+      return { messageId: Number(result.messageId) };
+    },
+    edit: async (msgId, text) => {
+      await editMessageTelegram(originatingTo, msgId, text, {
+        textMode: "html",
+        mux,
+      });
+    },
+    delete: async (msgId) => {
+      await deleteMessageTelegram(originatingTo, msgId, { mux });
+    },
+  };
+  const draftStream = createTelegramDraftStream({
+    transport,
+    minInitialChars: 30,
+    log: logVerbose,
+    warn: logVerbose,
+  });
+
+  // Fire-and-forget ack reaction (same gate as direct path).
+  const ackEmoji = resolveAckReaction(cfg, "default", {
+    channel: "telegram",
+    accountId: ctx.AccountId,
+  });
+  if (ackEmoji) {
+    void reactMessageTelegram(originatingTo, Number(messageId), ackEmoji, { mux }).catch(() => {});
+  }
+
+  let lastPartialText = "";
+  let markDispatchIdle: (() => void) | undefined;
+  let finalizedViaPreviewMessage = false;
+  try {
+    await dispatchReplyWithBufferedBlockDispatcher({
+      ctx,
+      cfg,
+      dispatcherOptions: {
+        deliver: async (payload, info) => {
+          if (info.kind === "final") {
+            const finalized = await tryFinalizeDraftAsEdit({
+              draftStream,
+              finalText: payload.text,
+              hasMedia: Boolean(payload.mediaUrl) || (payload.mediaUrls?.length ?? 0) > 0,
+              isError: payload.isError ?? false,
+              editFn: (msgId, text) =>
+                editMessageTelegram(originatingTo, msgId, text, { textMode: "html", mux }),
+            });
+            if (finalized) {
+              finalizedViaPreviewMessage = true;
+              return;
+            }
+          }
+          // Fallback: send via routeReply (routes through mux outbound adapter).
+          await routeReply({
+            payload,
+            channel: "telegram",
+            to: originatingTo,
+            sessionKey,
+            accountId: ctx.AccountId,
+            threadId: ctx.MessageThreadId,
+            cfg,
+          });
+        },
+        onError: (err) => {
+          warn(`mux telegram reply failed: ${String(err)}`);
+        },
+        ...(onReplyStart ? { onReplyStart } : {}),
+      },
+      replyOptions: {
+        disableBlockStreaming: true,
+        onPartialReply: (replyPayload) => {
+          const text = replyPayload.text;
+          if (!text || text === lastPartialText) {
+            return;
+          }
+          if (
+            lastPartialText &&
+            lastPartialText.startsWith(text) &&
+            text.length < lastPartialText.length
+          ) {
+            return;
+          }
+          lastPartialText = text;
+          draftStream.update(text);
+        },
+        onTypingController: (typing) => {
+          markDispatchIdle = () => typing.markDispatchIdle();
+          params.onMarkDispatchIdle(markDispatchIdle);
+        },
+      },
+    });
+  } catch (err) {
+    warn(`mux inbound dispatch failed messageId=${messageId}: ${String(err)}`);
+  } finally {
+    await cleanupDraftStream(draftStream, finalizedViaPreviewMessage);
+  }
 }

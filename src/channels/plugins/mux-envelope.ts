@@ -267,7 +267,6 @@ export function buildTelegramReplyMarkup(buttons?: TelegramButtons) {
 export function buildTelegramRawSend(params: {
   to: string;
   text: string;
-  mediaUrl?: string;
   buttons?: TelegramButtons;
   messageThreadId?: number;
   replyToMessageId?: number;
@@ -285,29 +284,78 @@ export function buildTelegramRawSend(params: {
             },
           }
         : { reply_to_message_id: Math.trunc(params.replyToMessageId) };
-  const baseBody = {
-    chat_id: params.to,
-    ...(params.messageThreadId != null ? { message_thread_id: params.messageThreadId } : {}),
-    ...replyParams,
-    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-  };
-  if (params.mediaUrl) {
-    return {
-      method: "sendPhoto" as const,
-      body: {
-        ...baseBody,
-        photo: params.mediaUrl,
-        ...(params.text ? { caption: params.text, parse_mode: "HTML" as const } : {}),
-      },
-    };
-  }
   return {
     method: "sendMessage" as const,
     body: {
-      ...baseBody,
+      chat_id: params.to,
       text: params.text,
       parse_mode: "HTML" as const,
+      ...(params.messageThreadId != null ? { message_thread_id: params.messageThreadId } : {}),
+      ...replyParams,
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     },
+  };
+}
+
+const MEDIA_FIELD: Record<string, string> = {
+  sendPhoto: "photo",
+  sendDocument: "document",
+  sendAnimation: "animation",
+  sendVideo: "video",
+  sendVideoNote: "video_note",
+  sendVoice: "voice",
+  sendAudio: "audio",
+  sendSticker: "sticker",
+};
+
+export function buildTelegramRawSendMedia(params: {
+  method: string;
+  mediaUrl: string;
+  /** Base64-encoded file content for local file uploads through mux. */
+  fileBase64?: string;
+  /** Original filename (used with fileBase64 for multipart upload). */
+  fileName?: string;
+  caption?: string;
+  messageThreadId?: number;
+  replyToMessageId?: number;
+  buttons?: TelegramButtons;
+}) {
+  const field = MEDIA_FIELD[params.method] ?? "document";
+  const replyMarkup = buildTelegramReplyMarkup(params.buttons);
+  return {
+    method: params.method,
+    body: {
+      // When fileBase64 is set, the mux-server will use multipart upload
+      // instead of passing a URL/file_id in the media field.
+      ...(params.fileBase64
+        ? { __fileBase64: params.fileBase64, __fileField: field, __fileName: params.fileName }
+        : { [field]: params.mediaUrl }),
+      ...(params.caption ? { caption: params.caption, parse_mode: "HTML" } : {}),
+      ...(params.messageThreadId != null ? { message_thread_id: params.messageThreadId } : {}),
+      ...(params.replyToMessageId != null ? { reply_to_message_id: params.replyToMessageId } : {}),
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    },
+  };
+}
+
+export function buildTelegramRawSetMessageReaction(params: {
+  messageId: number;
+  emoji: string;
+  remove?: boolean;
+}) {
+  return {
+    method: "setMessageReaction" as const,
+    body: {
+      message_id: params.messageId,
+      reaction: params.remove ? [] : [{ type: "emoji", emoji: params.emoji }],
+    },
+  };
+}
+
+export function buildTelegramRawDeleteMessage(params: { messageId: number }) {
+  return {
+    method: "deleteMessage" as const,
+    body: { message_id: params.messageId },
   };
 }
 
@@ -315,6 +363,7 @@ export function buildTelegramRawEditMessageText(params: {
   messageId: number;
   text: string;
   buttons?: TelegramButtons;
+  parseMode?: "HTML";
 }) {
   const replyMarkup = buildTelegramReplyMarkup(params.buttons);
   return {
@@ -322,7 +371,65 @@ export function buildTelegramRawEditMessageText(params: {
     body: {
       message_id: params.messageId,
       text: params.text,
+      ...(params.parseMode ? { parse_mode: params.parseMode } : {}),
       ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    },
+  };
+}
+
+export function buildTelegramRawSendPlainText(params: {
+  to: string;
+  text: string;
+  messageThreadId?: number;
+  replyToMessageId?: number;
+}) {
+  return {
+    method: "sendMessage" as const,
+    body: {
+      chat_id: params.to,
+      text: params.text,
+      ...(params.messageThreadId != null ? { message_thread_id: params.messageThreadId } : {}),
+      ...(params.replyToMessageId != null ? { reply_to_message_id: params.replyToMessageId } : {}),
+    },
+  };
+}
+
+export function buildTelegramRawSendPoll(params: {
+  question: string;
+  options: string[];
+  allowsMultipleAnswers?: boolean;
+  isAnonymous?: boolean;
+  openPeriod?: number;
+  messageThreadId?: number;
+  replyToMessageId?: number;
+  silent?: boolean;
+}) {
+  return {
+    method: "sendPoll" as const,
+    body: {
+      question: params.question,
+      options: params.options.map((text) => ({ text })),
+      ...(params.allowsMultipleAnswers ? { allows_multiple_answers: true } : {}),
+      ...(params.isAnonymous === false ? { is_anonymous: false } : {}),
+      ...(params.openPeriod != null ? { open_period: params.openPeriod } : {}),
+      ...(params.messageThreadId != null ? { message_thread_id: params.messageThreadId } : {}),
+      ...(params.replyToMessageId != null ? { reply_to_message_id: params.replyToMessageId } : {}),
+      ...(params.silent ? { disable_notification: true } : {}),
+    },
+  };
+}
+
+export function buildTelegramRawCreateForumTopic(params: {
+  name: string;
+  iconColor?: number;
+  iconCustomEmojiId?: string;
+}) {
+  return {
+    method: "createForumTopic" as const,
+    body: {
+      name: params.name,
+      ...(params.iconColor != null ? { icon_color: params.iconColor } : {}),
+      ...(params.iconCustomEmojiId ? { icon_custom_emoji_id: params.iconCustomEmojiId } : {}),
     },
   };
 }

@@ -6,6 +6,7 @@ import {
   deleteAccountFromConfigSection,
   formatPairingApproveHint,
   getChatChannelMeta,
+  isMuxEnabled,
   listTelegramAccountIds,
   listTelegramDirectoryGroupsFromConfig,
   listTelegramDirectoryPeersFromConfig,
@@ -16,19 +17,16 @@ import {
   PAIRING_APPROVED_MESSAGE,
   parseTelegramReplyToMessageId,
   parseTelegramThreadId,
-  isMuxEnabled,
-  renderTelegramHtmlText,
-  resolveMarkdownTableMode,
   resolveDefaultTelegramAccountId,
   resolveTelegramAccount,
   resolveTelegramGroupRequireMention,
   resolveTelegramGroupToolPolicy,
-  sendViaMux,
   setAccountEnabledInConfigSection,
   telegramOnboardingAdapter,
   TelegramConfigSchema,
   type ChannelMessageActionAdapter,
   type ChannelPlugin,
+  type MuxTransportOpts,
   type OpenClawConfig,
   type ResolvedTelegramAccount,
   type TelegramProbe,
@@ -36,6 +34,23 @@ import {
 import { getTelegramRuntime } from "./runtime.js";
 
 const meta = getChatChannelMeta("telegram");
+
+function resolveMuxOpts(params: {
+  cfg: OpenClawConfig;
+  accountId?: string | null;
+  sessionKey?: string | null;
+}): MuxTransportOpts | undefined {
+  if (
+    !isMuxEnabled({
+      cfg: params.cfg,
+      channel: "telegram",
+      accountId: params.accountId ?? undefined,
+    })
+  ) {
+    return undefined;
+  }
+  return { cfg: params.cfg, sessionKey: params.sessionKey ?? "" };
+}
 
 const telegramMessageActions: ChannelMessageActionAdapter = {
   listActions: (ctx) =>
@@ -52,90 +67,6 @@ const telegramMessageActions: ChannelMessageActionAdapter = {
 };
 
 type TelegramButtons = Array<Array<{ text: string; callback_data: string }>>;
-
-function renderMuxTelegramHtml(params: {
-  cfg: OpenClawConfig;
-  accountId?: string;
-  text: string;
-}): string {
-  const tableMode = resolveMarkdownTableMode({
-    cfg: params.cfg,
-    channel: "telegram",
-    accountId: params.accountId,
-  });
-  return renderTelegramHtmlText(params.text, {
-    textMode: "markdown",
-    tableMode,
-  });
-}
-
-function buildTelegramReplyMarkup(buttons?: TelegramButtons) {
-  if (!buttons?.length) {
-    return undefined;
-  }
-  const rows = buttons
-    .map((row) =>
-      row
-        .filter((button) => button?.text && button?.callback_data)
-        .map((button) => ({
-          text: button.text,
-          callback_data: button.callback_data,
-        })),
-    )
-    .filter((row) => row.length > 0);
-  if (rows.length === 0) {
-    return undefined;
-  }
-  return { inline_keyboard: rows };
-}
-
-function buildTelegramRawSend(params: {
-  to: string;
-  htmlText: string;
-  mediaUrl?: string;
-  buttons?: TelegramButtons;
-  messageThreadId?: number;
-  replyToMessageId?: number;
-  quoteText?: string;
-}) {
-  const replyMarkup = buildTelegramReplyMarkup(params.buttons);
-  const replyParams =
-    params.replyToMessageId == null
-      ? {}
-      : params.quoteText
-        ? {
-            reply_parameters: {
-              message_id: Math.trunc(params.replyToMessageId),
-              quote: params.quoteText,
-            },
-          }
-        : { reply_to_message_id: Math.trunc(params.replyToMessageId) };
-  const baseBody = {
-    chat_id: params.to,
-    ...(params.messageThreadId != null ? { message_thread_id: params.messageThreadId } : {}),
-    ...replyParams,
-    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-  };
-  if (params.mediaUrl) {
-    return {
-      method: "sendPhoto" as const,
-      body: {
-        ...baseBody,
-        photo: params.mediaUrl,
-        ...(params.htmlText ? { caption: params.htmlText, parse_mode: "HTML" as const } : {}),
-      },
-    };
-  }
-  return {
-    method: "sendMessage" as const,
-    body: {
-      ...baseBody,
-      text: params.htmlText,
-      parse_mode: "HTML" as const,
-    },
-  };
-}
-
 
 export const telegramPlugin: ChannelPlugin<ResolvedTelegramAccount, TelegramProbe> = {
   id: "telegram",
@@ -345,31 +276,20 @@ export const telegramPlugin: ChannelPlugin<ResolvedTelegramAccount, TelegramProb
     chunkerMode: "markdown",
     textChunkLimit: 4000,
     pollMaxOptions: 10,
-    sendText: async ({ cfg, to, text, accountId, deps, replyToId, threadId, silent, sessionKey }) => {
+    sendText: async ({
+      cfg,
+      to,
+      text,
+      accountId,
+      deps,
+      replyToId,
+      threadId,
+      silent,
+      sessionKey,
+    }) => {
       const replyToMessageId = parseTelegramReplyToMessageId(replyToId);
       const messageThreadId = parseTelegramThreadId(threadId);
-      if (isMuxEnabled({ cfg, channel: "telegram", accountId: accountId ?? undefined })) {
-        const htmlText = renderMuxTelegramHtml({ cfg, accountId: accountId ?? undefined, text });
-        const result = await sendViaMux({
-          cfg,
-          channel: "telegram",
-          accountId: accountId ?? undefined,
-          sessionKey,
-          to,
-          text,
-          replyToId,
-          threadId,
-          raw: {
-            telegram: buildTelegramRawSend({
-              to,
-              htmlText,
-              messageThreadId,
-              replyToMessageId,
-            }),
-          },
-        });
-        return { channel: "telegram", ...result };
-      }
+      const mux = resolveMuxOpts({ cfg, accountId, sessionKey });
       const send = deps?.sendTelegram ?? getTelegramRuntime().channel.telegram.sendMessageTelegram;
       const result = await send(to, text, {
         verbose: false,
@@ -377,6 +297,7 @@ export const telegramPlugin: ChannelPlugin<ResolvedTelegramAccount, TelegramProb
         replyToMessageId,
         accountId: accountId ?? undefined,
         silent: silent ?? undefined,
+        mux,
       });
       return { channel: "telegram", ...result };
     },
@@ -394,30 +315,7 @@ export const telegramPlugin: ChannelPlugin<ResolvedTelegramAccount, TelegramProb
     }) => {
       const replyToMessageId = parseTelegramReplyToMessageId(replyToId);
       const messageThreadId = parseTelegramThreadId(threadId);
-      if (isMuxEnabled({ cfg, channel: "telegram", accountId: accountId ?? undefined })) {
-        const htmlText = renderMuxTelegramHtml({ cfg, accountId: accountId ?? undefined, text });
-        const result = await sendViaMux({
-          cfg,
-          channel: "telegram",
-          accountId: accountId ?? undefined,
-          sessionKey,
-          to,
-          text,
-          mediaUrl,
-          replyToId,
-          threadId,
-          raw: {
-            telegram: buildTelegramRawSend({
-              to,
-              htmlText,
-              mediaUrl,
-              messageThreadId,
-              replyToMessageId,
-            }),
-          },
-        });
-        return { channel: "telegram", ...result };
-      }
+      const mux = resolveMuxOpts({ cfg, accountId, sessionKey });
       const send = deps?.sendTelegram ?? getTelegramRuntime().channel.telegram.sendMessageTelegram;
       const result = await send(to, text, {
         verbose: false,
@@ -426,6 +324,7 @@ export const telegramPlugin: ChannelPlugin<ResolvedTelegramAccount, TelegramProb
         replyToMessageId,
         accountId: accountId ?? undefined,
         silent: silent ?? undefined,
+        mux,
       });
       return { channel: "telegram", ...result };
     },
@@ -444,93 +343,16 @@ export const telegramPlugin: ChannelPlugin<ResolvedTelegramAccount, TelegramProb
           ? [payload.mediaUrl]
           : [];
 
-      if (isMuxEnabled({ cfg, channel: "telegram", accountId: accountId ?? undefined })) {
-        if (mediaUrls.length === 0) {
-          const htmlText = renderMuxTelegramHtml({
-            cfg,
-            accountId: accountId ?? undefined,
-            text,
-          });
-          const result = await sendViaMux({
-            cfg,
-            channel: "telegram",
-            accountId: accountId ?? undefined,
-            sessionKey,
-            to,
-            text,
-            replyToId,
-            threadId,
-            channelData:
-              typeof payload.channelData === "object" && payload.channelData !== null
-                ? payload.channelData
-                : undefined,
-            raw: {
-              telegram: buildTelegramRawSend({
-                to,
-                htmlText,
-                buttons: telegramData?.buttons,
-                quoteText,
-                messageThreadId,
-                replyToMessageId,
-              }),
-            },
-          });
-          return { channel: "telegram", ...result };
-        }
-
-        let finalResult:
-          | {
-              messageId: string;
-              chatId?: string;
-              channelId?: string;
-              toJid?: string;
-              conversationId?: string;
-              pollId?: string;
-            }
-          | undefined;
-        for (let i = 0; i < mediaUrls.length; i += 1) {
-          const mediaUrl = mediaUrls[i];
-          const isFirst = i === 0;
-          const htmlText = renderMuxTelegramHtml({
-            cfg,
-            accountId: accountId ?? undefined,
-            text: isFirst ? text : "",
-          });
-          finalResult = await sendViaMux({
-            cfg,
-            channel: "telegram",
-            accountId: accountId ?? undefined,
-            sessionKey,
-            to,
-            text: isFirst ? text : "",
-            mediaUrl,
-            replyToId,
-            threadId,
-            channelData:
-              typeof payload.channelData === "object" && payload.channelData !== null
-                ? payload.channelData
-                : undefined,
-            raw: {
-              telegram: buildTelegramRawSend({
-                to,
-                htmlText,
-                mediaUrl,
-                buttons: isFirst ? telegramData?.buttons : undefined,
-                quoteText,
-                messageThreadId,
-                replyToMessageId,
-              }),
-            },
-          });
-        }
-        return { channel: "telegram", ...(finalResult ?? { messageId: "unknown", chatId: to }) };
-      }
+      const mux = resolveMuxOpts({ cfg, accountId, sessionKey });
       const send = deps?.sendTelegram ?? getTelegramRuntime().channel.telegram.sendMessageTelegram;
       const baseOpts = {
         verbose: false,
+        textMode: "html" as const,
         messageThreadId,
         replyToMessageId,
+        quoteText,
         accountId: accountId ?? undefined,
+        mux,
       };
 
       if (mediaUrls.length === 0) {

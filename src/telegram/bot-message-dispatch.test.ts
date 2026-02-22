@@ -6,11 +6,16 @@ import { STATE_DIR } from "../config/paths.js";
 const createTelegramDraftStream = vi.hoisted(() => vi.fn());
 const dispatchReplyWithBufferedBlockDispatcher = vi.hoisted(() => vi.fn());
 const deliverReplies = vi.hoisted(() => vi.fn());
+const buildTelegramThreadParams = vi.hoisted(() => vi.fn());
 const editMessageTelegram = vi.hoisted(() => vi.fn());
 
-vi.mock("./draft-stream.js", () => ({
-  createTelegramDraftStream,
-}));
+vi.mock("./draft-stream.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./draft-stream.js")>();
+  return {
+    ...actual,
+    createTelegramDraftStream,
+  };
+});
 
 vi.mock("../auto-reply/reply/provider-dispatcher.js", () => ({
   dispatchReplyWithBufferedBlockDispatcher,
@@ -18,6 +23,10 @@ vi.mock("../auto-reply/reply/provider-dispatcher.js", () => ({
 
 vi.mock("./bot/delivery.js", () => ({
   deliverReplies,
+}));
+
+vi.mock("./bot/helpers.js", () => ({
+  buildTelegramThreadParams,
 }));
 
 vi.mock("./send.js", () => ({
@@ -38,6 +47,7 @@ describe("dispatchTelegramMessage draft streaming", () => {
     createTelegramDraftStream.mockReset();
     dispatchReplyWithBufferedBlockDispatcher.mockReset();
     deliverReplies.mockReset();
+    buildTelegramThreadParams.mockReset();
     editMessageTelegram.mockReset();
   });
 
@@ -139,6 +149,7 @@ describe("dispatchTelegramMessage draft streaming", () => {
         return { queuedFinal: true };
       },
     );
+    buildTelegramThreadParams.mockResolvedValue({ message_thread_id: 777 });
     deliverReplies.mockResolvedValue({ delivered: true });
 
     const context = createContext({
@@ -148,10 +159,10 @@ describe("dispatchTelegramMessage draft streaming", () => {
     });
     await dispatchWithContext({ context });
 
-    expect(createTelegramDraftStream).toHaveBeenCalledWith(
+    expect(buildTelegramThreadParams).toHaveBeenCalledWith(
       expect.objectContaining({
-        chatId: 123,
-        thread: { id: 777, scope: "dm" },
+        id: 777,
+        scope: "dm",
       }),
     );
     expect(draftStream.update).toHaveBeenCalledWith("Hello");

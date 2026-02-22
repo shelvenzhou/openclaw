@@ -1,8 +1,8 @@
-import type { IncomingMessage, ServerResponse } from "node:http";
-import { SignJWT } from "jose";
 import { generateKeyPairSync } from "node:crypto";
 import fs from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
+import { SignJWT } from "jose";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { __resetMuxJwksCacheForTest } from "./mux-jwt.js";
 
@@ -11,6 +11,10 @@ const OPENCLAW_ID = "openclaw-rt-1";
 const mocks = vi.hoisted(() => ({
   loadConfig: vi.fn(),
   dispatchInboundMessage: vi.fn(async () => ({
+    queuedFinal: false,
+    counts: { tool: 0, block: 0, final: 0 },
+  })),
+  dispatchReplyWithBufferedBlockDispatcher: vi.fn(async () => ({
     queuedFinal: false,
     counts: { tool: 0, block: 0, final: 0 },
   })),
@@ -32,6 +36,15 @@ vi.mock("../auto-reply/dispatch.js", async (importOriginal) => {
   return {
     ...actual,
     dispatchInboundMessage: mocks.dispatchInboundMessage,
+  };
+});
+
+vi.mock("../auto-reply/reply/provider-dispatcher.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../auto-reply/reply/provider-dispatcher.js")>();
+  return {
+    ...actual,
+    dispatchReplyWithBufferedBlockDispatcher: mocks.dispatchReplyWithBufferedBlockDispatcher,
   };
 });
 
@@ -117,6 +130,7 @@ function createResponse(): ServerResponse & { bodyText: string; headersMap: Map<
 afterEach(() => {
   mocks.loadConfig.mockReset();
   mocks.dispatchInboundMessage.mockClear();
+  mocks.dispatchReplyWithBufferedBlockDispatcher.mockClear();
   mocks.resolveTelegramCallbackAction.mockReset();
   mocks.sendTypingViaMux.mockReset();
   mocks.fetchMuxFileStream.mockReset();
@@ -280,8 +294,9 @@ describe("handleMuxInboundHttpRequest", () => {
     expect(JSON.parse(okRes.bodyText)).toEqual({ ok: true, eventId: "mux-msg-1" });
 
     await waitForAsyncDispatch();
-    expect(mocks.dispatchInboundMessage).toHaveBeenCalledTimes(1);
-    const call = mocks.dispatchInboundMessage.mock.calls[0]?.[0] as
+    // Telegram now uses dispatchReplyWithBufferedBlockDispatcher for streaming support.
+    expect(mocks.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
+    const call = mocks.dispatchReplyWithBufferedBlockDispatcher.mock.calls[0]?.[0] as
       | {
           ctx?: {
             Provider?: string;
@@ -297,11 +312,15 @@ describe("handleMuxInboundHttpRequest", () => {
             ChannelData?: Record<string, unknown>;
             MediaPaths?: string[];
           };
+          replyOptions?: {
+            disableBlockStreaming?: boolean;
+            onPartialReply?: unknown;
+          };
         }
       | undefined;
     expect(call?.ctx).toMatchObject({
       Provider: "telegram",
-      Surface: "mux",
+      Surface: "telegram",
       OriginatingChannel: "telegram",
       OriginatingTo: "telegram:123",
       SessionKey: "main",
@@ -311,8 +330,11 @@ describe("handleMuxInboundHttpRequest", () => {
       CommandBody: "hello mux",
       CommandAuthorized: true,
     });
-    expect(call?.ctx?.ChannelData).toBeUndefined();
+    expect(call?.ctx?.ChannelData).toMatchObject({ inboundTransport: "mux" });
     expect(call?.ctx?.MediaPaths).toBeUndefined();
+    // Verify streaming is enabled.
+    expect(call?.replyOptions?.disableBlockStreaming).toBe(true);
+    expect(call?.replyOptions?.onPartialReply).toBeTypeOf("function");
   });
 
   test("accepts mux inbound jwt auth and reuses cached jwks", async () => {
@@ -387,7 +409,8 @@ describe("handleMuxInboundHttpRequest", () => {
     expect(secondRes.statusCode).toBe(202);
 
     await waitForAsyncDispatch();
-    expect(mocks.dispatchInboundMessage).toHaveBeenCalledTimes(2);
+    // Telegram uses dispatchReplyWithBufferedBlockDispatcher.
+    expect(mocks.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(2);
     expect(jwksFetchCount).toBe(1);
   });
 
@@ -672,8 +695,8 @@ describe("handleMuxInboundHttpRequest", () => {
     expect(res.statusCode).toBe(202);
 
     await waitForAsyncDispatch();
-    expect(mocks.dispatchInboundMessage).toHaveBeenCalledTimes(1);
-    const call = mocks.dispatchInboundMessage.mock.calls[0]?.[0] as
+    expect(mocks.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
+    const call = mocks.dispatchReplyWithBufferedBlockDispatcher.mock.calls[0]?.[0] as
       | {
           ctx?: {
             MessageSid?: string;
@@ -770,8 +793,8 @@ describe("handleMuxInboundHttpRequest", () => {
       cfg: expect.any(Object),
       url: "http://mux.local/v1/mux/files/telegram?fileId=abc123",
     });
-    expect(mocks.dispatchInboundMessage).toHaveBeenCalledTimes(1);
-    const call = mocks.dispatchInboundMessage.mock.calls[0]?.[0] as
+    expect(mocks.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
+    const call = mocks.dispatchReplyWithBufferedBlockDispatcher.mock.calls[0]?.[0] as
       | {
           ctx?: {
             MediaPaths?: string[];
@@ -820,7 +843,7 @@ describe("handleMuxInboundHttpRequest", () => {
         },
       },
     });
-    mocks.dispatchInboundMessage.mockImplementationOnce(async () => {
+    mocks.dispatchReplyWithBufferedBlockDispatcher.mockImplementationOnce(async () => {
       await new Promise((resolveSleep) => setTimeout(resolveSleep, 250));
       return {
         queuedFinal: false,
@@ -851,7 +874,7 @@ describe("handleMuxInboundHttpRequest", () => {
     expect(elapsedMs).toBeLessThan(120);
 
     await new Promise((resolveSleep) => setTimeout(resolveSleep, 300));
-    expect(mocks.dispatchInboundMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
   });
 
   test("handles telegram callback edit actions via mux raw outbound", async () => {
@@ -1053,8 +1076,9 @@ describe("handleMuxInboundHttpRequest", () => {
     expect(await handleMuxInboundHttpRequest(req, res)).toBe(true);
     expect(res.statusCode).toBe(202);
     await waitForAsyncDispatch();
-    expect(mocks.dispatchInboundMessage).toHaveBeenCalledTimes(1);
-    const call = mocks.dispatchInboundMessage.mock.calls[0]?.[0] as
+    // Telegram callback-forward also goes through the streaming dispatcher.
+    expect(mocks.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
+    const call = mocks.dispatchReplyWithBufferedBlockDispatcher.mock.calls[0]?.[0] as
       | {
           ctx?: {
             Body?: string;
@@ -1068,5 +1092,69 @@ describe("handleMuxInboundHttpRequest", () => {
       RawBody: "/model openai/gpt-5",
       CommandBody: "/model openai/gpt-5",
     });
+  });
+
+  test("non-telegram channels keep Surface=mux and use dispatchInboundMessage", async () => {
+    const jwtFixture = createJwtFixture();
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = resolveFetchUrl(input);
+      if (url === "http://mux.local/.well-known/jwks.json") {
+        return new Response(JSON.stringify(jwtFixture.jwks), {
+          status: 200,
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+        });
+      }
+      throw new Error(`unexpected fetch url ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const token = await jwtFixture.mintToken({
+      issuer: "http://mux.local",
+      subject: OPENCLAW_ID,
+      audience: "openclaw-mux-inbound",
+      scope: "mux:inbound",
+    });
+
+    mocks.loadConfig.mockReturnValue({
+      gateway: {
+        http: {
+          endpoints: {
+            mux: {
+              enabled: true,
+              baseUrl: "http://mux.local",
+            },
+          },
+        },
+      },
+    });
+
+    const req = createRequest({
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+        "x-openclaw-id": OPENCLAW_ID,
+      },
+      body: {
+        channel: "discord",
+        sessionKey: "dc:dm:42",
+        to: "discord:dm:42",
+        from: "discord:user:42",
+        body: "hello from discord",
+        messageId: "dc-msg-1",
+        openclawId: OPENCLAW_ID,
+      },
+    });
+    const res = createResponse();
+    expect(await handleMuxInboundHttpRequest(req, res)).toBe(true);
+    expect(res.statusCode).toBe(202);
+
+    await waitForAsyncDispatch();
+    // Discord uses the non-streaming dispatchInboundMessage path.
+    expect(mocks.dispatchInboundMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.dispatchReplyWithBufferedBlockDispatcher).not.toHaveBeenCalled();
+    const call = mocks.dispatchInboundMessage.mock.calls[0]?.[0] as
+      | { ctx?: { Surface?: string } }
+      | undefined;
+    expect(call?.ctx?.Surface).toBe("mux");
   });
 });

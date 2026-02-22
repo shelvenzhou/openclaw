@@ -26,6 +26,7 @@ export type OutboundSendContext = {
   /** Active agent id for per-agent outbound media root scoping. */
   agentId?: string;
   accountId?: string | null;
+  sessionKey?: string;
   gateway?: OutboundGatewayContext;
   toolContext?: ChannelThreadingToolContext;
   deps?: OutboundSendDeps;
@@ -64,6 +65,7 @@ export async function executeSendAction(params: {
       cfg: params.ctx.cfg,
       params: params.ctx.params,
       accountId: params.ctx.accountId ?? undefined,
+      sessionKey: params.ctx.sessionKey,
       gateway: params.ctx.gateway,
       toolContext: params.ctx.toolContext,
       dryRun: params.ctx.dryRun,

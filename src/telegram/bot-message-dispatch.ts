@@ -22,10 +22,15 @@ import type { RuntimeEnv } from "../runtime.js";
 import type { TelegramMessageContext } from "./bot-message-context.js";
 import type { TelegramBotOptions } from "./bot.js";
 import { deliverReplies } from "./bot/delivery.js";
+import { buildTelegramThreadParams } from "./bot/helpers.js";
 import type { TelegramStreamMode } from "./bot/types.js";
 import type { TelegramInlineButtons } from "./button-types.js";
 import { resolveTelegramDraftStreamingChunking } from "./draft-chunking.js";
-import { createTelegramDraftStream } from "./draft-stream.js";
+import {
+  cleanupDraftStream,
+  createTelegramDraftStream,
+  tryFinalizeDraftAsEdit,
+} from "./draft-stream.js";
 import { editMessageTelegram } from "./send.js";
 import { cacheSticker, describeStickerImage } from "./sticker-cache.js";
 
@@ -98,16 +103,31 @@ export const dispatchTelegramMessage = async ({
   const draftReplyToMessageId =
     replyToMode !== "off" && typeof msg.message_id === "number" ? msg.message_id : undefined;
   const draftStream = canStreamDraft
-    ? createTelegramDraftStream({
-        api: bot.api,
-        chatId,
-        maxChars: draftMaxChars,
-        thread: threadSpec,
-        replyToMessageId: draftReplyToMessageId,
-        minInitialChars: DRAFT_MIN_INITIAL_CHARS,
-        log: logVerbose,
-        warn: logVerbose,
-      })
+    ? (() => {
+        const threadParams = buildTelegramThreadParams(threadSpec);
+        const replyParams =
+          draftReplyToMessageId != null
+            ? { ...threadParams, reply_to_message_id: draftReplyToMessageId }
+            : threadParams;
+        return createTelegramDraftStream({
+          transport: {
+            send: async (text) => {
+              const sent = await bot.api.sendMessage(chatId, text, replyParams);
+              return { messageId: sent.message_id };
+            },
+            edit: async (messageId, text) => {
+              await bot.api.editMessageText(chatId, messageId, text);
+            },
+            delete: async (messageId) => {
+              await bot.api.deleteMessage(chatId, messageId);
+            },
+          },
+          maxChars: draftMaxChars,
+          minInitialChars: DRAFT_MIN_INITIAL_CHARS,
+          log: logVerbose,
+          warn: logVerbose,
+        });
+      })()
     : undefined;
   const draftChunking =
     draftStream && streamMode === "block"
@@ -302,91 +322,46 @@ export const dispatchTelegramMessage = async ({
           if (info.kind === "final") {
             await flushDraft();
             const hasMedia = Boolean(payload.mediaUrl) || (payload.mediaUrls?.length ?? 0) > 0;
-            const previewMessageId = draftStream?.messageId();
-            const finalText = payload.text;
-            const currentPreviewText = streamMode === "block" ? draftText : lastPartialText;
             const previewButtons = (
               payload.channelData?.telegram as { buttons?: TelegramInlineButtons } | undefined
             )?.buttons;
-            let draftStoppedForPreviewEdit = false;
-            // Skip preview edit for error payloads to avoid overwriting previous content
-            const canFinalizeViaPreviewEdit =
-              !finalizedViaPreviewMessage &&
-              !hasMedia &&
-              typeof finalText === "string" &&
-              finalText.length > 0 &&
-              typeof previewMessageId === "number" &&
-              finalText.length <= draftMaxChars &&
-              !payload.isError;
-            if (canFinalizeViaPreviewEdit) {
+
+            // Regressive text suppression (direct path only): ignore final edits
+            // shorter than the current preview (e.g., "Okay." -> "Ok").
+            const currentPreviewText = streamMode === "block" ? draftText : lastPartialText;
+            if (
+              draftStream?.messageId() &&
+              currentPreviewText &&
+              typeof payload.text === "string" &&
+              currentPreviewText.startsWith(payload.text) &&
+              payload.text.length < currentPreviewText.length
+            ) {
               await draftStream?.stop();
-              draftStoppedForPreviewEdit = true;
-              if (
-                currentPreviewText &&
-                currentPreviewText.startsWith(finalText) &&
-                finalText.length < currentPreviewText.length
-              ) {
-                // Ignore regressive final edits (e.g., "Okay." -> "Ok"), which
-                // can appear transiently in some provider streams.
-                return;
-              }
-              try {
-                await editMessageTelegram(chatId, previewMessageId, finalText, {
-                  api: bot.api,
-                  cfg,
-                  accountId: route.accountId,
-                  linkPreview: telegramCfg.linkPreview,
-                  buttons: previewButtons,
-                });
+              return;
+            }
+
+            if (draftStream && !finalizedViaPreviewMessage) {
+              const finalized = await tryFinalizeDraftAsEdit({
+                draftStream,
+                finalText: payload.text,
+                hasMedia,
+                isError: payload.isError ?? false,
+                maxChars: draftMaxChars,
+                editFn: async (msgId, text) => {
+                  await editMessageTelegram(chatId, msgId, text, {
+                    api: bot.api,
+                    cfg,
+                    accountId: route.accountId,
+                    linkPreview: telegramCfg.linkPreview,
+                    buttons: previewButtons,
+                  });
+                },
+                log: logVerbose,
+              });
+              if (finalized) {
                 finalizedViaPreviewMessage = true;
                 deliveryState.delivered = true;
                 return;
-              } catch (err) {
-                logVerbose(
-                  `telegram: preview final edit failed; falling back to standard send (${String(err)})`,
-                );
-              }
-            }
-            if (
-              !hasMedia &&
-              !payload.isError &&
-              typeof finalText === "string" &&
-              finalText.length > draftMaxChars
-            ) {
-              logVerbose(
-                `telegram: preview final too long for edit (${finalText.length} > ${draftMaxChars}); falling back to standard send`,
-              );
-            }
-            if (!draftStoppedForPreviewEdit) {
-              await draftStream?.stop();
-            }
-            // Check if stop() sent a message (debounce released on isFinal)
-            // If so, edit that message instead of sending a new one
-            const messageIdAfterStop = draftStream?.messageId();
-            if (
-              !finalizedViaPreviewMessage &&
-              typeof messageIdAfterStop === "number" &&
-              typeof finalText === "string" &&
-              finalText.length > 0 &&
-              finalText.length <= draftMaxChars &&
-              !hasMedia &&
-              !payload.isError
-            ) {
-              try {
-                await editMessageTelegram(chatId, messageIdAfterStop, finalText, {
-                  api: bot.api,
-                  cfg,
-                  accountId: route.accountId,
-                  linkPreview: telegramCfg.linkPreview,
-                  buttons: previewButtons,
-                });
-                finalizedViaPreviewMessage = true;
-                deliveryState.delivered = true;
-                return;
-              } catch (err) {
-                logVerbose(
-                  `telegram: post-stop preview edit failed; falling back to standard send (${String(err)})`,
-                );
               }
             }
           }
@@ -454,10 +429,8 @@ export const dispatchTelegramMessage = async ({
       },
     }));
   } finally {
-    // Must stop() first to flush debounced content before clear() wipes state
-    await draftStream?.stop();
-    if (!finalizedViaPreviewMessage) {
-      await draftStream?.clear();
+    if (draftStream) {
+      await cleanupDraftStream(draftStream, finalizedViaPreviewMessage);
     }
   }
   let sentFallback = false;

@@ -1,128 +1,97 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createTelegramDraftStream } from "./draft-stream.js";
+import { createTelegramDraftStream, type TelegramDraftStreamTransport } from "./draft-stream.js";
 
-function createMockDraftApi(sendMessageImpl?: () => Promise<{ message_id: number }>) {
+function createMockTransport(
+  sendImpl?: () => Promise<{ messageId: number }>,
+): TelegramDraftStreamTransport & {
+  send: ReturnType<typeof vi.fn>;
+  edit: ReturnType<typeof vi.fn>;
+  delete: ReturnType<typeof vi.fn>;
+} {
   return {
-    sendMessage: vi.fn(sendMessageImpl ?? (async () => ({ message_id: 17 }))),
-    editMessageText: vi.fn().mockResolvedValue(true),
-    deleteMessage: vi.fn().mockResolvedValue(true),
+    send: vi.fn(sendImpl ?? (async () => ({ messageId: 17 }))),
+    edit: vi.fn().mockResolvedValue(undefined),
+    delete: vi.fn().mockResolvedValue(undefined),
   };
 }
 
-function createForumDraftStream(api: ReturnType<typeof createMockDraftApi>) {
-  return createThreadedDraftStream(api, { id: 99, scope: "forum" });
-}
-
-function createThreadedDraftStream(
-  api: ReturnType<typeof createMockDraftApi>,
-  thread: { id: number; scope: "forum" | "dm" },
-) {
-  return createTelegramDraftStream({
-    // oxlint-disable-next-line typescript/no-explicit-any
-    api: api as any,
-    chatId: 123,
-    thread,
-  });
-}
-
-async function expectInitialForumSend(
-  api: ReturnType<typeof createMockDraftApi>,
-  text = "Hello",
-): Promise<void> {
-  await vi.waitFor(() =>
-    expect(api.sendMessage).toHaveBeenCalledWith(123, text, { message_thread_id: 99 }),
-  );
-}
-
 describe("createTelegramDraftStream", () => {
-  it("sends stream preview message with message_thread_id when provided", async () => {
-    const api = createMockDraftApi();
-    const stream = createForumDraftStream(api);
+  it("sends stream preview message via transport", async () => {
+    const transport = createMockTransport();
+    const stream = createTelegramDraftStream({ transport });
 
     stream.update("Hello");
-    await expectInitialForumSend(api);
+    await vi.waitFor(() => expect(transport.send).toHaveBeenCalledWith("Hello"));
   });
 
   it("edits existing stream preview message on subsequent updates", async () => {
-    const api = createMockDraftApi();
-    const stream = createForumDraftStream(api);
+    const transport = createMockTransport();
+    const stream = createTelegramDraftStream({ transport });
 
     stream.update("Hello");
-    await expectInitialForumSend(api);
-    await (api.sendMessage.mock.results[0]?.value as Promise<unknown>);
+    await vi.waitFor(() => expect(transport.send).toHaveBeenCalledWith("Hello"));
+    await (transport.send.mock.results[0]?.value as Promise<unknown>);
 
     stream.update("Hello again");
     await stream.flush();
 
-    expect(api.editMessageText).toHaveBeenCalledWith(123, 17, "Hello again");
+    expect(transport.edit).toHaveBeenCalledWith(17, "Hello again");
   });
 
   it("waits for in-flight updates before final flush edit", async () => {
-    let resolveSend: ((value: { message_id: number }) => void) | undefined;
-    const firstSend = new Promise<{ message_id: number }>((resolve) => {
+    let resolveSend: ((value: { messageId: number }) => void) | undefined;
+    const firstSend = new Promise<{ messageId: number }>((resolve) => {
       resolveSend = resolve;
     });
-    const api = createMockDraftApi(() => firstSend);
-    const stream = createForumDraftStream(api);
+    const transport = createMockTransport(() => firstSend);
+    const stream = createTelegramDraftStream({ transport });
 
     stream.update("Hello");
-    await vi.waitFor(() => expect(api.sendMessage).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(transport.send).toHaveBeenCalledTimes(1));
     stream.update("Hello final");
     const flushPromise = stream.flush();
-    expect(api.editMessageText).not.toHaveBeenCalled();
+    expect(transport.edit).not.toHaveBeenCalled();
 
-    resolveSend?.({ message_id: 17 });
+    resolveSend?.({ messageId: 17 });
     await flushPromise;
 
-    expect(api.editMessageText).toHaveBeenCalledWith(123, 17, "Hello final");
+    expect(transport.edit).toHaveBeenCalledWith(17, "Hello final");
   });
 
-  it("omits message_thread_id for general topic id", async () => {
-    const api = createMockDraftApi();
-    const stream = createThreadedDraftStream(api, { id: 1, scope: "forum" });
+  it("clears preview on cleanup via transport.delete", async () => {
+    const transport = createMockTransport();
+    const stream = createTelegramDraftStream({ transport });
 
     stream.update("Hello");
-
-    await vi.waitFor(() => expect(api.sendMessage).toHaveBeenCalledWith(123, "Hello", undefined));
-  });
-
-  it("includes message_thread_id for dm threads and clears preview on cleanup", async () => {
-    const api = createMockDraftApi();
-    const stream = createThreadedDraftStream(api, { id: 42, scope: "dm" });
-
-    stream.update("Hello");
-    await vi.waitFor(() =>
-      expect(api.sendMessage).toHaveBeenCalledWith(123, "Hello", { message_thread_id: 42 }),
-    );
+    await vi.waitFor(() => expect(transport.send).toHaveBeenCalledWith("Hello"));
+    await (transport.send.mock.results[0]?.value as Promise<unknown>);
     await stream.clear();
 
-    expect(api.deleteMessage).toHaveBeenCalledWith(123, 17);
+    expect(transport.delete).toHaveBeenCalledWith(17);
   });
 
   it("creates new message after forceNewMessage is called", async () => {
-    const api = {
-      sendMessage: vi
+    const transport: TelegramDraftStreamTransport & {
+      send: ReturnType<typeof vi.fn>;
+      edit: ReturnType<typeof vi.fn>;
+    } = {
+      send: vi
         .fn()
-        .mockResolvedValueOnce({ message_id: 17 })
-        .mockResolvedValueOnce({ message_id: 42 }),
-      editMessageText: vi.fn().mockResolvedValue(true),
-      deleteMessage: vi.fn().mockResolvedValue(true),
+        .mockResolvedValueOnce({ messageId: 17 })
+        .mockResolvedValueOnce({ messageId: 42 }),
+      edit: vi.fn().mockResolvedValue(undefined),
     };
-    const stream = createTelegramDraftStream({
-      // oxlint-disable-next-line typescript/no-explicit-any
-      api: api as any,
-      chatId: 123,
-    });
+    const stream = createTelegramDraftStream({ transport });
 
     // First message
     stream.update("Hello");
     await stream.flush();
-    expect(api.sendMessage).toHaveBeenCalledTimes(1);
+    expect(transport.send).toHaveBeenCalledTimes(1);
 
     // Normal edit (same message)
     stream.update("Hello edited");
     await stream.flush();
-    expect(api.editMessageText).toHaveBeenCalledWith(123, 17, "Hello edited");
+    expect(transport.edit).toHaveBeenCalledWith(17, "Hello edited");
 
     // Force new message (e.g. after thinking block ends)
     stream.forceNewMessage();
@@ -130,18 +99,12 @@ describe("createTelegramDraftStream", () => {
     await stream.flush();
 
     // Should have sent a second new message, not edited the first
-    expect(api.sendMessage).toHaveBeenCalledTimes(2);
-    expect(api.sendMessage).toHaveBeenLastCalledWith(123, "After thinking", undefined);
+    expect(transport.send).toHaveBeenCalledTimes(2);
+    expect(transport.send).toHaveBeenLastCalledWith("After thinking");
   });
 });
 
 describe("draft stream initial message debounce", () => {
-  const createMockApi = () => ({
-    sendMessage: vi.fn().mockResolvedValue({ message_id: 42 }),
-    editMessageText: vi.fn().mockResolvedValue(true),
-    deleteMessage: vi.fn().mockResolvedValue(true),
-  });
-
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -152,11 +115,9 @@ describe("draft stream initial message debounce", () => {
 
   describe("isFinal has highest priority", () => {
     it("sends immediately on stop() even with 1 character", async () => {
-      const api = createMockApi();
+      const transport = createMockTransport(async () => ({ messageId: 42 }));
       const stream = createTelegramDraftStream({
-        // oxlint-disable-next-line typescript/no-explicit-any
-        api: api as any,
-        chatId: 123,
+        transport,
         minInitialChars: 30,
       });
 
@@ -164,15 +125,13 @@ describe("draft stream initial message debounce", () => {
       await stream.stop();
       await stream.flush();
 
-      expect(api.sendMessage).toHaveBeenCalledWith(123, "Y", undefined);
+      expect(transport.send).toHaveBeenCalledWith("Y");
     });
 
     it("sends immediately on stop() with short sentence", async () => {
-      const api = createMockApi();
+      const transport = createMockTransport(async () => ({ messageId: 42 }));
       const stream = createTelegramDraftStream({
-        // oxlint-disable-next-line typescript/no-explicit-any
-        api: api as any,
-        chatId: 123,
+        transport,
         minInitialChars: 30,
       });
 
@@ -180,32 +139,28 @@ describe("draft stream initial message debounce", () => {
       await stream.stop();
       await stream.flush();
 
-      expect(api.sendMessage).toHaveBeenCalledWith(123, "Ok.", undefined);
+      expect(transport.send).toHaveBeenCalledWith("Ok.");
     });
   });
 
   describe("minInitialChars threshold", () => {
     it("does not send first message below threshold", async () => {
-      const api = createMockApi();
+      const transport = createMockTransport(async () => ({ messageId: 42 }));
       const stream = createTelegramDraftStream({
-        // oxlint-disable-next-line typescript/no-explicit-any
-        api: api as any,
-        chatId: 123,
+        transport,
         minInitialChars: 30,
       });
 
       stream.update("Processing"); // 10 chars, below 30
       await stream.flush();
 
-      expect(api.sendMessage).not.toHaveBeenCalled();
+      expect(transport.send).not.toHaveBeenCalled();
     });
 
     it("sends first message when reaching threshold", async () => {
-      const api = createMockApi();
+      const transport = createMockTransport(async () => ({ messageId: 42 }));
       const stream = createTelegramDraftStream({
-        // oxlint-disable-next-line typescript/no-explicit-any
-        api: api as any,
-        chatId: 123,
+        transport,
         minInitialChars: 30,
       });
 
@@ -213,63 +168,54 @@ describe("draft stream initial message debounce", () => {
       stream.update("I am processing your request..");
       await stream.flush();
 
-      expect(api.sendMessage).toHaveBeenCalled();
+      expect(transport.send).toHaveBeenCalled();
     });
 
     it("works with longer text above threshold", async () => {
-      const api = createMockApi();
+      const transport = createMockTransport(async () => ({ messageId: 42 }));
       const stream = createTelegramDraftStream({
-        // oxlint-disable-next-line typescript/no-explicit-any
-        api: api as any,
-        chatId: 123,
+        transport,
         minInitialChars: 30,
       });
 
       stream.update("I am processing your request, please wait a moment"); // 50 chars
       await stream.flush();
 
-      expect(api.sendMessage).toHaveBeenCalled();
+      expect(transport.send).toHaveBeenCalled();
     });
   });
 
   describe("subsequent updates after first message", () => {
     it("edits normally after first message is sent", async () => {
-      const api = createMockApi();
+      const transport = createMockTransport(async () => ({ messageId: 42 }));
       const stream = createTelegramDraftStream({
-        // oxlint-disable-next-line typescript/no-explicit-any
-        api: api as any,
-        chatId: 123,
+        transport,
         minInitialChars: 30,
       });
 
       // First message at threshold (30 chars)
       stream.update("I am processing your request..");
       await stream.flush();
-      expect(api.sendMessage).toHaveBeenCalledTimes(1);
+      expect(transport.send).toHaveBeenCalledTimes(1);
 
       // Subsequent updates should edit, not wait for threshold
       stream.update("I am processing your request.. and summarizing");
       await stream.flush();
 
-      expect(api.editMessageText).toHaveBeenCalled();
-      expect(api.sendMessage).toHaveBeenCalledTimes(1); // still only 1 send
+      expect(transport.edit).toHaveBeenCalled();
+      expect(transport.send).toHaveBeenCalledTimes(1); // still only 1 send
     });
   });
 
   describe("default behavior without debounce params", () => {
     it("sends immediately without minInitialChars set (backward compatible)", async () => {
-      const api = createMockApi();
-      const stream = createTelegramDraftStream({
-        // oxlint-disable-next-line typescript/no-explicit-any
-        api: api as any,
-        chatId: 123,
-        // no minInitialChars (backward-compatible behavior)
-      });
+      const transport = createMockTransport(async () => ({ messageId: 42 }));
+      const stream = createTelegramDraftStream({ transport });
 
       stream.update("Hi");
       await stream.flush();
 
-      expect(api.sendMessage).toHaveBeenCalledWith(123, "Hi", undefined);
+      expect(transport.send).toHaveBeenCalledWith("Hi");
     });
   });
 });

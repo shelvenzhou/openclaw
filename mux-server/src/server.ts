@@ -1,10 +1,10 @@
-import { RequestClient } from "@buape/carbon";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { RequestClient } from "@buape/carbon";
 import WebSocket from "ws";
 import {
   buildWhatsAppInboundEnvelope,
@@ -1699,17 +1699,71 @@ function requireDiscordBotToken(): string {
   return token;
 }
 
-async function sendTelegram(
-  method:
-    | "sendMessage"
-    | "sendPhoto"
-    | "sendChatAction"
-    | "editMessageText"
-    | "answerCallbackQuery",
-  body: Record<string, unknown>,
-) {
+const ALLOWED_TELEGRAM_METHODS = new Set([
+  // Sending
+  "sendMessage",
+  "sendPhoto",
+  "sendDocument",
+  "sendAnimation",
+  "sendVideo",
+  "sendVideoNote",
+  "sendVoice",
+  "sendAudio",
+  "sendSticker",
+  "sendPoll",
+  "sendChatAction",
+  // Editing / deleting
+  "editMessageText",
+  "deleteMessage",
+  // Reactions
+  "setMessageReaction",
+  // Callbacks
+  "answerCallbackQuery",
+  // Bot menu
+  "setMyCommands",
+  "deleteMyCommands",
+  // Forum topics
+  "createForumTopic",
+]);
+
+async function sendTelegram(method: string, body: Record<string, unknown>) {
   const token = requireTelegramBotToken();
-  const response = await fetch(`${telegramApiBaseUrl}/bot${token}/${method}`, {
+  const url = `${telegramApiBaseUrl}/bot${token}/${method}`;
+
+  // When __fileBase64 is present, the openclaw side is sending a local file
+  // that needs to be uploaded via multipart form data.
+  const fileBase64 = typeof body.__fileBase64 === "string" ? body.__fileBase64 : undefined;
+  const fileField = typeof body.__fileField === "string" ? body.__fileField : undefined;
+  const fileName = typeof body.__fileName === "string" ? body.__fileName : "file";
+
+  if (fileBase64 && fileField) {
+    const cleanBody = { ...body };
+    delete cleanBody.__fileBase64;
+    delete cleanBody.__fileField;
+    delete cleanBody.__fileName;
+
+    const formData = new FormData();
+    const fileBuffer = Buffer.from(fileBase64, "base64");
+    formData.append(fileField, new Blob([fileBuffer]), fileName);
+
+    for (const [key, value] of Object.entries(cleanBody)) {
+      if (value == null) {
+        continue;
+      }
+      formData.append(
+        key,
+        typeof value === "object"
+          ? JSON.stringify(value)
+          : String(value as string | number | boolean),
+      );
+    }
+
+    const response = await fetch(url, { method: "POST", body: formData });
+    const result = (await response.json()) as Record<string, unknown>;
+    return { response, result };
+  }
+
+  const response = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
@@ -6764,14 +6818,9 @@ const server = http.createServer(async (req, res) => {
         const telegramRawMethod = readNonEmptyString(telegramRaw?.method);
         const telegramRawBody = asRecord(telegramRaw?.body);
         if (telegramRawMethod && telegramRawBody) {
-          const telegramMethod =
-            telegramRawMethod === "sendMessage" ||
-            telegramRawMethod === "sendPhoto" ||
-            telegramRawMethod === "sendChatAction" ||
-            telegramRawMethod === "editMessageText" ||
-            telegramRawMethod === "answerCallbackQuery"
-              ? telegramRawMethod
-              : null;
+          const telegramMethod = ALLOWED_TELEGRAM_METHODS.has(telegramRawMethod)
+            ? telegramRawMethod
+            : null;
           if (!telegramMethod) {
             return {
               statusCode: 400,
@@ -6781,14 +6830,33 @@ const server = http.createServer(async (req, res) => {
               }),
             };
           }
+          // Methods that don't target a specific chat
+          const NO_CHAT_ID_METHODS = new Set([
+            "answerCallbackQuery",
+            "setMyCommands",
+            "deleteMyCommands",
+          ]);
+
+          // Methods that support message_thread_id (forum topics)
+          const THREAD_ID_METHODS = new Set([
+            "sendMessage",
+            "sendPhoto",
+            "sendDocument",
+            "sendAnimation",
+            "sendVideo",
+            "sendVideoNote",
+            "sendVoice",
+            "sendAudio",
+            "sendSticker",
+            "sendPoll",
+            "sendChatAction",
+            "createForumTopic",
+          ]);
+
           const finalBody: Record<string, unknown> = { ...telegramRawBody };
-          if (telegramMethod !== "answerCallbackQuery") {
+          if (!NO_CHAT_ID_METHODS.has(telegramMethod)) {
             finalBody.chat_id = to;
-            const supportsThreadId =
-              telegramMethod === "sendMessage" ||
-              telegramMethod === "sendPhoto" ||
-              telegramMethod === "sendChatAction";
-            if (supportsThreadId) {
+            if (THREAD_ID_METHODS.has(telegramMethod)) {
               if (boundRoute.topicId) {
                 if (isGeneralForumTopic && telegramMethod !== "sendChatAction") {
                   delete finalBody.message_thread_id;

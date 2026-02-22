@@ -1,9 +1,13 @@
-import type { Bot } from "grammy";
 import { createDraftStreamLoop } from "../channels/draft-stream-loop.js";
-import { buildTelegramThreadParams, type TelegramThreadSpec } from "./bot/helpers.js";
 
 const TELEGRAM_STREAM_MAX_CHARS = 4096;
 const DEFAULT_THROTTLE_MS = 1000;
+
+export type TelegramDraftStreamTransport = {
+  send: (text: string) => Promise<{ messageId: number }>;
+  edit: (messageId: number, text: string) => Promise<void>;
+  delete?: (messageId: number) => Promise<void>;
+};
 
 export type TelegramDraftStream = {
   update: (text: string) => void;
@@ -16,11 +20,8 @@ export type TelegramDraftStream = {
 };
 
 export function createTelegramDraftStream(params: {
-  api: Bot["api"];
-  chatId: number;
+  transport: TelegramDraftStreamTransport;
   maxChars?: number;
-  thread?: TelegramThreadSpec | null;
-  replyToMessageId?: number;
   throttleMs?: number;
   /** Minimum chars before sending first message (debounce for push notifications) */
   minInitialChars?: number;
@@ -33,12 +34,7 @@ export function createTelegramDraftStream(params: {
   );
   const throttleMs = Math.max(250, params.throttleMs ?? DEFAULT_THROTTLE_MS);
   const minInitialChars = params.minInitialChars;
-  const chatId = params.chatId;
-  const threadParams = buildTelegramThreadParams(params.thread);
-  const replyParams =
-    params.replyToMessageId != null
-      ? { ...threadParams, reply_to_message_id: params.replyToMessageId }
-      : threadParams;
+  const transport = params.transport;
 
   let streamMessageId: number | undefined;
   let lastSentText = "";
@@ -77,11 +73,11 @@ export function createTelegramDraftStream(params: {
     lastSentText = trimmed;
     try {
       if (typeof streamMessageId === "number") {
-        await params.api.editMessageText(chatId, streamMessageId, trimmed);
+        await transport.edit(streamMessageId, trimmed);
         return true;
       }
-      const sent = await params.api.sendMessage(chatId, trimmed, replyParams);
-      const sentMessageId = sent?.message_id;
+      const sent = await transport.send(trimmed);
+      const sentMessageId = sent?.messageId;
       if (typeof sentMessageId !== "number" || !Number.isFinite(sentMessageId)) {
         stopped = true;
         params.warn?.("telegram stream preview stopped (missing message id from sendMessage)");
@@ -126,7 +122,7 @@ export function createTelegramDraftStream(params: {
       return;
     }
     try {
-      await params.api.deleteMessage(chatId, messageId);
+      await transport.delete?.(messageId);
     } catch (err) {
       params.warn?.(
         `telegram stream preview cleanup failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -150,4 +146,86 @@ export function createTelegramDraftStream(params: {
     stop,
     forceNewMessage,
   };
+}
+
+/**
+ * Attempt to finalize a draft stream by editing an existing preview message
+ * to the final text, avoiding a redundant send+delete cycle.
+ *
+ * Returns `true` when the edit succeeded (caller should skip fallback delivery).
+ */
+export async function tryFinalizeDraftAsEdit(params: {
+  draftStream: TelegramDraftStream;
+  finalText: string | undefined;
+  hasMedia: boolean;
+  isError: boolean;
+  maxChars?: number;
+  editFn: (messageId: number, text: string) => Promise<void>;
+  log?: (message: string) => void;
+}): Promise<boolean> {
+  const { draftStream, finalText, hasMedia, isError, editFn, log } = params;
+  const maxChars = params.maxChars ?? TELEGRAM_STREAM_MAX_CHARS;
+
+  await draftStream.flush();
+  const previewId = draftStream.messageId();
+
+  const canEdit =
+    typeof finalText === "string" &&
+    finalText.length > 0 &&
+    finalText.length <= maxChars &&
+    !hasMedia &&
+    !isError;
+
+  let stopped = false;
+
+  if (typeof previewId === "number" && canEdit) {
+    await draftStream.stop();
+    stopped = true;
+    try {
+      await editFn(previewId, finalText);
+      return true;
+    } catch (err) {
+      log?.(`telegram: preview final edit failed; falling back to standard send (${String(err)})`);
+    }
+  }
+
+  if (typeof finalText === "string" && finalText.length > maxChars && !hasMedia && !isError) {
+    log?.(
+      `telegram: preview final too long for edit (${finalText.length} > ${maxChars}); falling back to standard send`,
+    );
+  }
+
+  if (!stopped) {
+    await draftStream.stop();
+  }
+
+  // stop() may have flushed a debounced message that didn't exist before.
+  const messageIdAfterStop = draftStream.messageId();
+  if (typeof messageIdAfterStop === "number" && canEdit) {
+    try {
+      await editFn(messageIdAfterStop, finalText);
+      return true;
+    } catch (err) {
+      log?.(
+        `telegram: post-stop preview edit failed; falling back to standard send (${String(err)})`,
+      );
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Clean up a draft stream after delivery completes.
+ * Always stops the stream; clears (deletes preview message) only when
+ * the final text was NOT already edited in-place via `tryFinalizeDraftAsEdit`.
+ */
+export async function cleanupDraftStream(
+  draftStream: TelegramDraftStream,
+  finalizedViaEdit: boolean,
+): Promise<void> {
+  await draftStream.stop();
+  if (!finalizedViaEdit) {
+    await draftStream.clear();
+  }
 }
