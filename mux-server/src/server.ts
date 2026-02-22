@@ -6870,14 +6870,23 @@ const server = http.createServer(async (req, res) => {
           }
           const { response, result } = await sendTelegram(telegramMethod, finalBody);
           if (!response.ok || result.ok !== true) {
-            return {
-              statusCode: 502,
-              bodyText: JSON.stringify({
-                ok: false,
-                error: "telegram raw send failed",
-                details: result,
-              }),
-            };
+            // Telegram returns 400 "message is not modified" when an editMessageText
+            // call produces the same rendered text.  The direct bot path (grammY)
+            // silently swallows this — treat it as success here so the mux path
+            // behaves identically (keeps the preview message instead of deleting it).
+            const description = typeof result?.description === "string" ? result.description : "";
+            const isNotModified =
+              telegramMethod === "editMessageText" && /message is not modified/i.test(description);
+            if (!isNotModified) {
+              return {
+                statusCode: 502,
+                bodyText: JSON.stringify({
+                  ok: false,
+                  error: "telegram raw send failed",
+                  details: result,
+                }),
+              };
+            }
           }
           const resultData =
             typeof result.result === "object" && result.result
@@ -6886,7 +6895,9 @@ const server = http.createServer(async (req, res) => {
           const messageId =
             typeof resultData.message_id === "number" || typeof resultData.message_id === "string"
               ? String(resultData.message_id)
-              : "unknown";
+              : typeof finalBody.message_id === "number" || typeof finalBody.message_id === "string"
+                ? String(finalBody.message_id)
+                : "unknown";
           return {
             statusCode: 200,
             bodyText: JSON.stringify({

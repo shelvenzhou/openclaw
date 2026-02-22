@@ -594,19 +594,48 @@ async function dispatchMuxTelegram(params: {
     }
   }
 
+  // Draft stream transport — mirrors direct path (bot-message-dispatch.ts:113-123):
+  //   • send() and edit() use plain text (no parse_mode) during streaming
+  //   • send() includes reply_parameters pointing to the inbound message
+  //   • finalization (tryFinalizeDraftAsEdit editFn) uses textMode: "html"
+  const inboundMessageId = readMuxPositiveInt(messageId);
   const transport: TelegramDraftStreamTransport = {
     send: async (text) => {
-      const result = await sendMessageTelegram(originatingTo, text, {
-        textMode: "html",
-        messageThreadId,
-        mux,
+      const result = await sendViaMux({
+        cfg,
+        channel: "telegram",
+        sessionKey,
+        accountId: ctx.AccountId,
+        raw: {
+          telegram: {
+            method: "sendMessage",
+            body: {
+              text,
+              ...(messageThreadId != null ? { message_thread_id: messageThreadId } : {}),
+              ...(inboundMessageId != null
+                ? { reply_parameters: { message_id: inboundMessageId } }
+                : {}),
+            },
+          },
+        },
       });
       return { messageId: Number(result.messageId) };
     },
     edit: async (msgId, text) => {
-      await editMessageTelegram(originatingTo, msgId, text, {
-        textMode: "html",
-        mux,
+      await sendViaMux({
+        cfg,
+        channel: "telegram",
+        sessionKey,
+        accountId: ctx.AccountId,
+        raw: {
+          telegram: {
+            method: "editMessageText",
+            body: {
+              message_id: msgId,
+              text,
+            },
+          },
+        },
       });
     },
     delete: async (msgId) => {
@@ -644,8 +673,9 @@ async function dispatchMuxTelegram(params: {
               finalText: payload.text,
               hasMedia: Boolean(payload.mediaUrl) || (payload.mediaUrls?.length ?? 0) > 0,
               isError: payload.isError ?? false,
-              editFn: (msgId, text) =>
-                editMessageTelegram(originatingTo, msgId, text, { textMode: "html", mux }),
+              editFn: async (msgId, text) => {
+                await editMessageTelegram(originatingTo, msgId, text, { mux });
+              },
             });
             if (finalized) {
               finalizedViaPreviewMessage = true;
