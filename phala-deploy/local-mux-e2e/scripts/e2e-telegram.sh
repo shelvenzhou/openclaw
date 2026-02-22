@@ -9,14 +9,6 @@ COMPOSE_FILE="${STACK_DIR}/docker-compose.yml"
 : "${POLL_TIMEOUT:=60}"
 : "${LLM_TIMEOUT:=60}"
 
-# Optional local overrides for non-secret values.
-if [[ -f "${STACK_DIR}/.env.local" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "${STACK_DIR}/.env.local"
-  set +a
-fi
-
 compose() {
   docker compose -f "${COMPOSE_FILE}" "$@"
 }
@@ -30,15 +22,29 @@ for cmd in tgcli jq curl docker; do
   fi
 done
 
+# Source .env.local files so secrets don't need to be manually exported.
+REPO_ROOT="$(cd "${STACK_DIR}/../.." && pwd)"
+for envfile in "${STACK_DIR}/.env.local" "${REPO_ROOT}/.env.local"; do
+  if [[ -f "${envfile}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${envfile}"
+    set +a
+  fi
+done
+
+# Resolve TELEGRAM_BOT_TOKEN from mux-server container if not in env.
 if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
-  echo "[e2e] FATAL: TELEGRAM_BOT_TOKEN not set (use rv-exec)" >&2
+  TELEGRAM_BOT_TOKEN="$(docker exec mux-server-local-e2e printenv TELEGRAM_BOT_TOKEN 2>/dev/null)" || true
+fi
+if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+  echo "[e2e] FATAL: TELEGRAM_BOT_TOKEN not set and not found in mux-server container" >&2
   exit 1
 fi
 
-if [[ -z "${TELEGRAM_E2E_BOT_CHAT_ID:-}" ]]; then
-  echo "[e2e] FATAL: TELEGRAM_E2E_BOT_CHAT_ID not set (use rv-exec)" >&2
-  exit 1
-fi
+# Derive bot chat ID from token (the part before ':' is the bot user ID,
+# which is also the private chat ID for DMs with the bot).
+: "${TELEGRAM_E2E_BOT_CHAT_ID:=${TELEGRAM_BOT_TOKEN%%:*}}"
 
 if [[ -z "${MODEL_PRIMARY:-}" ]]; then
   echo "[e2e] FATAL: MODEL_PRIMARY not set — LLM is required for full round-trip tests" >&2
@@ -46,6 +52,10 @@ if [[ -z "${MODEL_PRIMARY:-}" ]]; then
 fi
 
 BOT_CHAT_ID="${TELEGRAM_E2E_BOT_CHAT_ID}"
+
+# Ensure tgcli knows about the bot chat (first-run requires sync).
+echo "[e2e] syncing tgcli chat list..."
+tgcli sync >/dev/null 2>&1 || true
 
 # ---------- temp file cleanup ----------
 

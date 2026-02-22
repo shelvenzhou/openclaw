@@ -13,16 +13,20 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v rv-exec >/dev/null 2>&1; then
-  echo "[local-mux-e2e] rv-exec is required for secret injection." >&2
-  exit 1
-fi
-
 # Optional local overrides for non-secret values.
 if [[ -f "${STACK_DIR}/.env.local" ]]; then
   set -a
   # shellcheck disable=SC1090
   source "${STACK_DIR}/.env.local"
+  set +a
+fi
+
+# Also source repo-root .env.local for secrets (CODEX_API_KEY, etc.)
+REPO_ROOT="$(cd "${STACK_DIR}/../.." && pwd)"
+if [[ -f "${REPO_ROOT}/.env.local" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${REPO_ROOT}/.env.local"
   set +a
 fi
 
@@ -109,8 +113,18 @@ OPENCLAW_CONFIG_B64=$(printf '%s' "$CONFIG_JSON" | base64 -w0)
 export OPENCLAW_CONFIG_B64
 
 # --- Bring up the stack ---
-rv-exec TELEGRAM_BOT_TOKEN DISCORD_BOT_TOKEN CODEX_API_KEY CODEX_API_ENDPOINT \
-  -- docker compose -f "${COMPOSE_FILE}" up -d --build --remove-orphans
+# Use rv-exec for secret injection when available; fall back to plain env if
+# the required secrets are already exported (e.g. from .env.local).
+if command -v rv-exec >/dev/null 2>&1; then
+  rv-exec TELEGRAM_BOT_TOKEN DISCORD_BOT_TOKEN CODEX_API_KEY CODEX_API_ENDPOINT \
+    -- docker compose -f "${COMPOSE_FILE}" up -d --build --remove-orphans
+else
+  if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+    echo "[local-mux-e2e] WARNING: TELEGRAM_BOT_TOKEN not set and rv-exec not found." >&2
+    echo "[local-mux-e2e] Install rv-exec or export secrets manually." >&2
+  fi
+  docker compose -f "${COMPOSE_FILE}" up -d --build --remove-orphans
+fi
 
 # --- Force-update the config inside the running container ---
 # The entrypoint only writes config on first boot (when the file doesn't exist).

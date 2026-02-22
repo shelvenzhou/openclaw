@@ -27,9 +27,14 @@ This stack mirrors the production shape on one machine:
 
 - Docker (Compose v2)
 - `curl`, `jq`
-- `rv-exec` configured with:
-  - `TELEGRAM_BOT_TOKEN`
-  - `DISCORD_BOT_TOKEN`
+- Secrets available via one of:
+  - `rv-exec` (preferred — automatically injects secrets into compose)
+  - `.env.local` files (repo-root for `CODEX_API_KEY`/`CODEX_API_ENDPOINT`, stack-level for `MODEL_PRIMARY` etc.)
+  - Direct env exports
+- Required secrets:
+  - `TELEGRAM_BOT_TOKEN` (or `DISCORD_BOT_TOKEN` for Discord tests)
+  - `CODEX_API_KEY` + `CODEX_API_ENDPOINT` (when `MODEL_PRIMARY` is set)
+- For Telegram e2e tests: `tgcli` (synced automatically by the e2e script)
 - Optional: a valid WhatsApp auth dir if you want to test WhatsApp:
   - `WA_AUTH_SOURCE=<path-to-local-test-auth>`
 - Optional override:
@@ -43,10 +48,12 @@ This stack mirrors the production shape on one machine:
 
 What `up.sh` does:
 
-1. Optionally copies WhatsApp auth snapshot into local state (if `WA_AUTH_SOURCE` is set).
-2. Injects secrets with `rv-exec` for compose interpolation.
-3. Runs `docker compose up -d --build --remove-orphans`.
-4. Patches the OpenClaw config in-container to enable mux and restarts OpenClaw.
+1. Sources `.env.local` from both the stack dir and the repo root (for secrets like `CODEX_API_KEY`).
+2. Optionally copies WhatsApp auth snapshot into local state (if `WA_AUTH_SOURCE` is set).
+3. Generates the OpenClaw config JSON with model provider, mux gateway, and channel settings.
+4. Uses `rv-exec` for secret injection if available; falls back to plain env otherwise.
+5. Runs `docker compose up -d --build --remove-orphans`.
+6. Writes the config into the running container and restarts OpenClaw.
 
 To enable WhatsApp inbound, set `WA_AUTH_SOURCE` inline or in `phala-deploy/local-mux-e2e/.env.local` (from `.env.example`).
 
@@ -83,7 +90,31 @@ Expected first reply:
 
 - `Paired successfully. You can chat now.`
 
-## Smoke Flow
+## Automated E2E Tests
+
+The e2e script handles pairing, tgcli sync, and all assertions automatically:
+
+```bash
+# Just two commands — no manual env setup needed:
+./phala-deploy/local-mux-e2e/scripts/up.sh
+./phala-deploy/local-mux-e2e/scripts/e2e-telegram.sh
+```
+
+The e2e script auto-resolves all required values:
+
+- `TELEGRAM_BOT_TOKEN` — from `.env.local` files or the mux-server container
+- `TELEGRAM_E2E_BOT_CHAT_ID` — derived from the bot token (part before `:`)
+- `MODEL_PRIMARY` — from `.env.local`
+- `tgcli sync` — runs automatically before first send
+
+What the Telegram e2e tests cover (9 assertions):
+
+1. **Text round-trip** — send text, verify inbound forwarding + AI reply
+2. **Photo round-trip** — send image, verify inbound forwarding + AI reply
+3. **Multi-action round-trip** — one prompt triggers sendMessage + sendDocument + setMessageReaction
+4. **File proxy** — verify mux file proxy returns 200 with content
+
+## Smoke Flow (Manual)
 
 1. Pair one chat per channel.
 2. Send `/help`.
@@ -103,13 +134,11 @@ Follow logs:
 Stop only:
 
 ```bash
-rv-exec TELEGRAM_BOT_TOKEN DISCORD_BOT_TOKEN -- \
-  bash -lc './phala-deploy/local-mux-e2e/scripts/down.sh'
+./phala-deploy/local-mux-e2e/scripts/down.sh
 ```
 
 Stop and wipe local test state:
 
 ```bash
-rv-exec TELEGRAM_BOT_TOKEN DISCORD_BOT_TOKEN -- \
-  bash -lc './phala-deploy/local-mux-e2e/scripts/down.sh --wipe'
+./phala-deploy/local-mux-e2e/scripts/down.sh --wipe
 ```
