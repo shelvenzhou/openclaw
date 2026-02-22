@@ -26,11 +26,7 @@ import { buildTelegramThreadParams } from "./bot/helpers.js";
 import type { TelegramStreamMode } from "./bot/types.js";
 import type { TelegramInlineButtons } from "./button-types.js";
 import { resolveTelegramDraftStreamingChunking } from "./draft-chunking.js";
-import {
-  cleanupDraftStream,
-  createTelegramDraftStream,
-  tryFinalizeDraftAsEdit,
-} from "./draft-stream.js";
+import { createTelegramStreamingDispatch } from "./draft-stream.js";
 import { editMessageTelegram } from "./send.js";
 import { cacheSticker, describeStickerImage } from "./sticker-cache.js";
 
@@ -102,14 +98,15 @@ export const dispatchTelegramMessage = async ({
   const canStreamDraft = streamMode !== "off" && !accountBlockStreamingEnabled;
   const draftReplyToMessageId =
     replyToMode !== "off" && typeof msg.message_id === "number" ? msg.message_id : undefined;
-  const draftStream = canStreamDraft
+  let previewButtons: TelegramInlineButtons | undefined;
+  const streaming = canStreamDraft
     ? (() => {
         const threadParams = buildTelegramThreadParams(threadSpec);
         const replyParams =
           draftReplyToMessageId != null
             ? { ...threadParams, reply_to_message_id: draftReplyToMessageId }
             : threadParams;
-        return createTelegramDraftStream({
+        return createTelegramStreamingDispatch({
           transport: {
             send: async (text) => {
               const sent = await bot.api.sendMessage(chatId, text, replyParams);
@@ -122,6 +119,15 @@ export const dispatchTelegramMessage = async ({
               await bot.api.deleteMessage(chatId, messageId);
             },
           },
+          editFn: async (msgId, text) => {
+            await editMessageTelegram(chatId, msgId, text, {
+              api: bot.api,
+              cfg,
+              accountId: route.accountId,
+              linkPreview: telegramCfg.linkPreview,
+              buttons: previewButtons,
+            });
+          },
           maxChars: draftMaxChars,
           minInitialChars: DRAFT_MIN_INITIAL_CHARS,
           log: logVerbose,
@@ -130,7 +136,7 @@ export const dispatchTelegramMessage = async ({
       })()
     : undefined;
   const draftChunking =
-    draftStream && streamMode === "block"
+    streaming && streamMode === "block"
       ? resolveTelegramDraftStreamingChunking(cfg, route.accountId)
       : undefined;
   const shouldSplitPreviewMessages = streamMode === "block";
@@ -140,7 +146,7 @@ export const dispatchTelegramMessage = async ({
   let draftText = "";
   let hasStreamedMessage = false;
   const updateDraftFromPartial = (text?: string) => {
-    if (!draftStream || !text) {
+    if (!streaming || !text) {
       return;
     }
     if (text === lastPartialText) {
@@ -160,7 +166,7 @@ export const dispatchTelegramMessage = async ({
         return;
       }
       lastPartialText = text;
-      draftStream.update(text);
+      streaming.draftStream.update(text);
       return;
     }
     let delta = text;
@@ -177,7 +183,7 @@ export const dispatchTelegramMessage = async ({
     }
     if (!draftChunker) {
       draftText = text;
-      draftStream.update(draftText);
+      streaming.draftStream.update(draftText);
       return;
     }
     draftChunker.append(delta);
@@ -185,12 +191,12 @@ export const dispatchTelegramMessage = async ({
       force: false,
       emit: (chunk) => {
         draftText += chunk;
-        draftStream.update(draftText);
+        streaming.draftStream.update(draftText);
       },
     });
   };
   const flushDraft = async () => {
-    if (!draftStream) {
+    if (!streaming) {
       return;
     }
     if (draftChunker?.hasBuffered()) {
@@ -202,16 +208,16 @@ export const dispatchTelegramMessage = async ({
       });
       draftChunker.reset();
       if (draftText) {
-        draftStream.update(draftText);
+        streaming.draftStream.update(draftText);
       }
     }
-    await draftStream.flush();
+    await streaming.draftStream.flush();
   };
 
   const disableBlockStreaming =
     typeof telegramCfg.blockStreaming === "boolean"
       ? !telegramCfg.blockStreaming
-      : draftStream || streamMode === "off"
+      : streaming || streamMode === "off"
         ? true
         : undefined;
 
@@ -290,7 +296,6 @@ export const dispatchTelegramMessage = async ({
     delivered: false,
     skippedNonSilent: 0,
   };
-  let finalizedViaPreviewMessage = false;
   const clearGroupHistory = () => {
     if (isGroup && historyKey) {
       clearHistoryEntriesIfEnabled({ historyMap: groupHistories, historyKey, limit: historyLimit });
@@ -321,45 +326,27 @@ export const dispatchTelegramMessage = async ({
         deliver: async (payload, info) => {
           if (info.kind === "final") {
             await flushDraft();
-            const hasMedia = Boolean(payload.mediaUrl) || (payload.mediaUrls?.length ?? 0) > 0;
-            const previewButtons = (
-              payload.channelData?.telegram as { buttons?: TelegramInlineButtons } | undefined
-            )?.buttons;
 
             // Regressive text suppression (direct path only): ignore final edits
             // shorter than the current preview (e.g., "Okay." -> "Ok").
             const currentPreviewText = streamMode === "block" ? draftText : lastPartialText;
             if (
-              draftStream?.messageId() &&
+              streaming?.draftStream.messageId() &&
               currentPreviewText &&
               typeof payload.text === "string" &&
               currentPreviewText.startsWith(payload.text) &&
               payload.text.length < currentPreviewText.length
             ) {
-              await draftStream?.stop();
+              await streaming?.draftStream.stop();
               return;
             }
 
-            if (draftStream && !finalizedViaPreviewMessage) {
-              const finalized = await tryFinalizeDraftAsEdit({
-                draftStream,
-                finalText: payload.text,
-                hasMedia,
-                isError: payload.isError ?? false,
-                maxChars: draftMaxChars,
-                editFn: async (msgId, text) => {
-                  await editMessageTelegram(chatId, msgId, text, {
-                    api: bot.api,
-                    cfg,
-                    accountId: route.accountId,
-                    linkPreview: telegramCfg.linkPreview,
-                    buttons: previewButtons,
-                  });
-                },
-                log: logVerbose,
-              });
-              if (finalized) {
-                finalizedViaPreviewMessage = true;
+            if (streaming) {
+              // Set previewButtons before tryFinalize so the editFn closure picks them up.
+              previewButtons = (
+                payload.channelData?.telegram as { buttons?: TelegramInlineButtons } | undefined
+              )?.buttons;
+              if (await streaming.tryFinalize(payload)) {
                 deliveryState.delivered = true;
                 return;
               }
@@ -397,8 +384,8 @@ export const dispatchTelegramMessage = async ({
       replyOptions: {
         skillFilter,
         disableBlockStreaming,
-        onPartialReply: draftStream ? (payload) => updateDraftFromPartial(payload.text) : undefined,
-        onAssistantMessageStart: draftStream
+        onPartialReply: streaming ? (payload) => updateDraftFromPartial(payload.text) : undefined,
+        onAssistantMessageStart: streaming
           ? () => {
               // Only split preview bubbles in block mode. In partial mode, keep
               // editing one preview message to avoid flooding the chat.
@@ -407,18 +394,18 @@ export const dispatchTelegramMessage = async ({
               );
               if (shouldSplitPreviewMessages && hasStreamedMessage) {
                 logVerbose(`telegram: calling forceNewMessage()`);
-                draftStream.forceNewMessage();
+                streaming.draftStream.forceNewMessage();
               }
               lastPartialText = "";
               draftText = "";
               draftChunker?.reset();
             }
           : undefined,
-        onReasoningEnd: draftStream
+        onReasoningEnd: streaming
           ? () => {
               // Same policy as assistant-message boundaries: split only in block mode.
               if (shouldSplitPreviewMessages && hasStreamedMessage) {
-                draftStream.forceNewMessage();
+                streaming.draftStream.forceNewMessage();
               }
               lastPartialText = "";
               draftText = "";
@@ -429,8 +416,8 @@ export const dispatchTelegramMessage = async ({
       },
     }));
   } finally {
-    if (draftStream) {
-      await cleanupDraftStream(draftStream, finalizedViaPreviewMessage);
+    if (streaming) {
+      await streaming.cleanup();
     }
   }
   let sentFallback = false;

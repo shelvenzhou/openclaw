@@ -43,12 +43,7 @@ import {
   resolveTelegramCallbackAction,
   type TelegramCallbackButtons,
 } from "../telegram/callback-actions.js";
-import {
-  cleanupDraftStream,
-  createTelegramDraftStream,
-  tryFinalizeDraftAsEdit,
-  type TelegramDraftStreamTransport,
-} from "../telegram/draft-stream.js";
+import { createTelegramStreamingDispatch } from "../telegram/draft-stream.js";
 import {
   deleteMessageTelegram,
   editMessageTelegram,
@@ -594,57 +589,58 @@ async function dispatchMuxTelegram(params: {
     }
   }
 
-  // Draft stream transport — mirrors direct path (bot-message-dispatch.ts:113-123):
+  // Draft stream transport — mirrors direct path (bot-message-dispatch.ts):
   //   • send() and edit() use plain text (no parse_mode) during streaming
   //   • send() includes reply_parameters pointing to the inbound message
-  //   • finalization (tryFinalizeDraftAsEdit editFn) uses textMode: "html"
+  //   • finalization editFn uses textMode: "html" (via editMessageTelegram)
   const inboundMessageId = readMuxPositiveInt(messageId);
-  const transport: TelegramDraftStreamTransport = {
-    send: async (text) => {
-      const result = await sendViaMux({
-        cfg,
-        channel: "telegram",
-        sessionKey,
-        accountId: ctx.AccountId,
-        raw: {
-          telegram: {
-            method: "sendMessage",
-            body: {
-              text,
-              ...(messageThreadId != null ? { message_thread_id: messageThreadId } : {}),
-              ...(inboundMessageId != null
-                ? { reply_parameters: { message_id: inboundMessageId } }
-                : {}),
+  const streaming = createTelegramStreamingDispatch({
+    transport: {
+      send: async (text) => {
+        const result = await sendViaMux({
+          cfg,
+          channel: "telegram",
+          sessionKey,
+          accountId: ctx.AccountId,
+          raw: {
+            telegram: {
+              method: "sendMessage",
+              body: {
+                text,
+                ...(messageThreadId != null ? { message_thread_id: messageThreadId } : {}),
+                ...(inboundMessageId != null
+                  ? { reply_parameters: { message_id: inboundMessageId } }
+                  : {}),
+              },
             },
           },
-        },
-      });
-      return { messageId: Number(result.messageId) };
-    },
-    edit: async (msgId, text) => {
-      await sendViaMux({
-        cfg,
-        channel: "telegram",
-        sessionKey,
-        accountId: ctx.AccountId,
-        raw: {
-          telegram: {
-            method: "editMessageText",
-            body: {
-              message_id: msgId,
-              text,
+        });
+        return { messageId: Number(result.messageId) };
+      },
+      edit: async (msgId, text) => {
+        await sendViaMux({
+          cfg,
+          channel: "telegram",
+          sessionKey,
+          accountId: ctx.AccountId,
+          raw: {
+            telegram: {
+              method: "editMessageText",
+              body: {
+                message_id: msgId,
+                text,
+              },
             },
           },
-        },
-      });
+        });
+      },
+      delete: async (msgId) => {
+        await deleteMessageTelegram(originatingTo, msgId, { mux });
+      },
     },
-    delete: async (msgId) => {
-      await deleteMessageTelegram(originatingTo, msgId, { mux });
+    editFn: async (msgId, text) => {
+      await editMessageTelegram(originatingTo, msgId, text, { mux });
     },
-  };
-  const draftStream = createTelegramDraftStream({
-    transport,
-    minInitialChars: 30,
     log: logVerbose,
     warn: logVerbose,
   });
@@ -658,29 +654,15 @@ async function dispatchMuxTelegram(params: {
     void reactMessageTelegram(originatingTo, Number(messageId), ackEmoji, { mux }).catch(() => {});
   }
 
-  let lastPartialText = "";
   let markDispatchIdle: (() => void) | undefined;
-  let finalizedViaPreviewMessage = false;
   try {
     await dispatchReplyWithBufferedBlockDispatcher({
       ctx,
       cfg,
       dispatcherOptions: {
         deliver: async (payload, info) => {
-          if (info.kind === "final") {
-            const finalized = await tryFinalizeDraftAsEdit({
-              draftStream,
-              finalText: payload.text,
-              hasMedia: Boolean(payload.mediaUrl) || (payload.mediaUrls?.length ?? 0) > 0,
-              isError: payload.isError ?? false,
-              editFn: async (msgId, text) => {
-                await editMessageTelegram(originatingTo, msgId, text, { mux });
-              },
-            });
-            if (finalized) {
-              finalizedViaPreviewMessage = true;
-              return;
-            }
+          if (info.kind === "final" && (await streaming.tryFinalize(payload))) {
+            return;
           }
           // Fallback: send via routeReply (routes through mux outbound adapter).
           await routeReply({
@@ -700,21 +682,7 @@ async function dispatchMuxTelegram(params: {
       },
       replyOptions: {
         disableBlockStreaming: true,
-        onPartialReply: (replyPayload) => {
-          const text = replyPayload.text;
-          if (!text || text === lastPartialText) {
-            return;
-          }
-          if (
-            lastPartialText &&
-            lastPartialText.startsWith(text) &&
-            text.length < lastPartialText.length
-          ) {
-            return;
-          }
-          lastPartialText = text;
-          draftStream.update(text);
-        },
+        onPartialReply: streaming.onPartialReply,
         onTypingController: (typing) => {
           markDispatchIdle = () => typing.markDispatchIdle();
           params.onMarkDispatchIdle(markDispatchIdle);
@@ -724,6 +692,6 @@ async function dispatchMuxTelegram(params: {
   } catch (err) {
     warn(`mux inbound dispatch failed messageId=${messageId}: ${String(err)}`);
   } finally {
-    await cleanupDraftStream(draftStream, finalizedViaPreviewMessage);
+    await streaming.cleanup();
   }
 }
