@@ -184,6 +184,38 @@ fence() {
   : "${FENCE_LINES:=0}"
 }
 
+# Poll until a log line since the fence matches ALL given patterns.
+# Each pattern is an extended grep regex; lines must match every pattern.
+# Writes elapsed seconds to stdout on success.  Returns 1 on timeout.
+wait_for_outbound_fields() {
+  local timeout="$1"
+  shift
+  local patterns=("$@")
+  local start
+  start="$(date +%s)"
+  while true; do
+    local now elapsed
+    now="$(date +%s)"
+    elapsed=$(( now - start ))
+    if (( elapsed >= timeout )); then
+      return 1
+    fi
+    local matched
+    matched="$(mux_log_tail)"
+    for pattern in "${patterns[@]}"; do
+      matched="$(echo "${matched}" | grep "${pattern}" 2>/dev/null || true)"
+      if [[ -z "${matched}" ]]; then
+        break
+      fi
+    done
+    if [[ -n "${matched}" ]]; then
+      echo "${elapsed}"
+      return 0
+    fi
+    sleep 3
+  done
+}
+
 # ---------- pairing (idempotent) ----------
 
 echo "[e2e] pairing: issuing token for telegram"
@@ -384,6 +416,164 @@ else
     fi
   else
     fail "file proxy returned HTTP ${proxy_status}"
+  fi
+fi
+
+# ==========================================================================
+# Transport-only tests (no AI — fast, no LLM cost)
+#
+# These tests verify mux transport fidelity without triggering LLM calls.
+# They use command interception (/reasoning argsMenu) and direct API calls.
+# ==========================================================================
+
+fence
+
+# ---------- test 5: argsMenu inline keyboard buttons ----------
+#
+# Sends /reasoning (no args).  mux-http.ts command menu interception
+# responds directly with inline keyboard buttons — no AI involved.
+# Proves: command interception + button serialization + mux outbound.
+
+echo "[e2e] test 5: argsMenu inline keyboard buttons (no AI)"
+tgcli send --to "${BOT_CHAT_ID}" --message "/reasoning"
+
+if elapsed="$(wait_for_inbound "${POLL_TIMEOUT}")"; then
+  pass "argsMenu inbound — forwarded in ${elapsed}s"
+else
+  fail "argsMenu inbound — no telegram_inbound_forwarded within ${POLL_TIMEOUT}s"
+fi
+
+if elapsed="$(wait_for_outbound_fields "${POLL_TIMEOUT}" \
+  '"outbound_request"' '"method":"sendMessage"' '"reply_markup"')"; then
+  pass "argsMenu outbound — sendMessage with reply_markup in ${elapsed}s"
+else
+  fail "argsMenu outbound — no sendMessage with reply_markup within ${POLL_TIMEOUT}s"
+fi
+
+fence
+
+# ---------- test 6: sticker inbound ----------
+#
+# Sends a sticker via tgcli.  Verifies mux-server forwards sticker messages.
+# Requires tgcli sticker packs — skips gracefully if none are available.
+
+echo "[e2e] test 6: sticker inbound (no AI)"
+
+sticker_file_id=""
+# Try tgcli sticker search first, then list.
+sticker_pack="$(tgcli stickers search --emoji "👍" --output json 2>/dev/null \
+  | jq -r '.[0].name // empty' 2>/dev/null)" || true
+if [[ -z "${sticker_pack}" ]]; then
+  sticker_pack="$(tgcli stickers list --output json 2>/dev/null \
+    | jq -r '.[0].name // empty' 2>/dev/null)" || true
+fi
+if [[ -n "${sticker_pack}" ]]; then
+  sticker_file_id="$(tgcli stickers show --pack "${sticker_pack}" --output json 2>/dev/null \
+    | jq -r '.[0].file_id // empty' 2>/dev/null)" || true
+fi
+
+if [[ -z "${sticker_file_id}" ]]; then
+  echo "[e2e] SKIP: sticker inbound — no sticker packs found via tgcli"
+else
+  tgcli send --to "${BOT_CHAT_ID}" --sticker "${sticker_file_id}"
+
+  if elapsed="$(wait_for_inbound "${POLL_TIMEOUT}")"; then
+    pass "sticker inbound — forwarded in ${elapsed}s"
+  else
+    fail "sticker inbound — no telegram_inbound_forwarded within ${POLL_TIMEOUT}s"
+  fi
+fi
+
+fence
+
+# ---------- test 7: document inbound ----------
+#
+# Sends a plain-text file as a document.  Verifies mux-server forwards
+# document messages to OpenClaw.
+
+echo "[e2e] test 7: document inbound (no AI)"
+
+DOC_FILE="/tmp/e2e-doc-${UUID}.txt"
+TMPFILES+=("$DOC_FILE")
+printf 'e2e document test %s\n' "${UUID}" > "$DOC_FILE"
+
+tgcli send --to "${BOT_CHAT_ID}" --file "$DOC_FILE" --caption "e2e-doc-${UUID}"
+
+if elapsed="$(wait_for_inbound "${POLL_TIMEOUT}")"; then
+  pass "document inbound — forwarded in ${elapsed}s"
+else
+  fail "document inbound — no telegram_inbound_forwarded within ${POLL_TIMEOUT}s"
+fi
+
+fence
+
+# ---------- test 8: threaded mode (forum topics) ----------
+#
+# Creates a forum topic in the bot DM via Bot API, sends /reasoning in
+# that topic, and verifies message_thread_id is preserved in outbound.
+# No separate group or manual setup needed — the bot has topics enabled.
+# Old e2e topics from previous runs are cleaned up automatically.
+
+echo "[e2e] test 8: threaded mode (forum topics, no AI)"
+
+if [[ -z "${user_chat_id}" ]]; then
+  echo "[e2e] SKIP: threaded mode — user_chat_id not resolved (test 4 dependency)"
+else
+  # Clean up topics left over from previous e2e runs.
+  E2E_THREADS_FILE="${STACK_DIR}/state/e2e-thread-ids.txt"
+  if [[ -f "${E2E_THREADS_FILE}" ]]; then
+    echo "[e2e] cleaning up old e2e topics..."
+    while IFS= read -r old_thread_id; do
+      if [[ -n "${old_thread_id}" ]]; then
+        curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteForumTopic" \
+          -H "Content-Type: application/json" \
+          --data "{\"chat_id\":\"${user_chat_id}\",\"message_thread_id\":${old_thread_id}}" >/dev/null 2>&1 || true
+      fi
+    done < "${E2E_THREADS_FILE}"
+    rm -f "${E2E_THREADS_FILE}"
+  fi
+
+  # Create a fresh topic for this run.
+  topic_response="$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/createForumTopic" \
+    -H "Content-Type: application/json" \
+    --data "{\"chat_id\":\"${user_chat_id}\",\"name\":\"e2e-thread-${UUID}\"}")"
+  E2E_TOPIC_ID="$(echo "${topic_response}" | jq -r '.result.message_thread_id // empty')"
+
+  if [[ -z "${E2E_TOPIC_ID}" ]]; then
+    echo "[e2e] SKIP: threaded mode — createForumTopic failed: ${topic_response}"
+  else
+    # Persist topic ID so next run can clean it up if this run crashes.
+    mkdir -p "${STACK_DIR}/state"
+    echo "${E2E_TOPIC_ID}" >> "${E2E_THREADS_FILE}"
+
+    echo "[e2e] created topic ${E2E_TOPIC_ID} in bot DM"
+
+    fence
+
+    # Send /reasoning in the topic.  Command interception responds with
+    # inline buttons — no AI needed.  The outbound must include
+    # message_thread_id (topic preservation through the mux path).
+    tgcli send --to "${BOT_CHAT_ID}" --topic "${E2E_TOPIC_ID}" \
+      --message "/reasoning"
+
+    if elapsed="$(wait_for_inbound "${POLL_TIMEOUT}")"; then
+      pass "threaded inbound — forwarded in ${elapsed}s"
+    else
+      fail "threaded inbound — no telegram_inbound_forwarded within ${POLL_TIMEOUT}s"
+    fi
+
+    if elapsed="$(wait_for_outbound_fields "${POLL_TIMEOUT}" \
+      '"outbound_request"' '"method":"sendMessage"' '"message_thread_id"')"; then
+      pass "threaded outbound — sendMessage with message_thread_id in ${elapsed}s"
+    else
+      fail "threaded outbound — no sendMessage with message_thread_id within ${POLL_TIMEOUT}s"
+    fi
+
+    # Clean up — delete the topic so it doesn't accumulate.
+    curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteForumTopic" \
+      -H "Content-Type: application/json" \
+      --data "{\"chat_id\":\"${user_chat_id}\",\"message_thread_id\":${E2E_TOPIC_ID}}" >/dev/null 2>&1 || true
+    sed -i "/${E2E_TOPIC_ID}/d" "${E2E_THREADS_FILE}" 2>/dev/null || true
   fi
 fi
 

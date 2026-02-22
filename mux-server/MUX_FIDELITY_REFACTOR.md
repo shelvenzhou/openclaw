@@ -124,7 +124,31 @@ pnpm build
 
 # E2E (requires local mux-server + Telegram bot)
 bash phala-deploy/local-mux-e2e/scripts/e2e-telegram.sh
+
+# E2E with threaded mode (requires a supergroup with topics)
+TELEGRAM_E2E_GROUP_ID=<supergroup_id> bash phala-deploy/local-mux-e2e/scripts/e2e-telegram.sh
 ```
+
+### Automated E2E coverage
+
+| Test                | What it proves                                                   | AI? |
+| ------------------- | ---------------------------------------------------------------- | --- |
+| 1. Text round-trip  | inbound forwarding + AI sendMessage outbound                     | Yes |
+| 2. Photo round-trip | image inbound + AI sendMessage outbound                          | Yes |
+| 3. Multi-action     | sendMessage + sendDocument + setMessageReaction outbound         | Yes |
+| 4. File proxy       | mux file proxy GET returns file bytes                            | No  |
+| 5. argsMenu buttons | command interception → sendMessage with reply_markup             | No  |
+| 6. Sticker inbound  | sticker forwarding (skips if no tgcli sticker packs)             | No  |
+| 7. Document inbound | document forwarding                                              | No  |
+| 8. Threaded mode    | creates topic in bot DM, message_thread_id preserved in outbound | No  |
+
+### Not yet covered by automated tests
+
+- Callback query (inline button tap) — tgcli cannot simulate button clicks
+- deleteMessage outbound — implicitly exercised by draft stream cleanup in AI tests
+- editMessageText outbound — implicitly exercised by draft stream in AI tests
+- sendChatAction (typing indicator) — implicit in AI tests
+- Discord / WhatsApp inbound+outbound — separate e2e scripts needed
 
 ### Manual Telegram test checklist
 

@@ -107,12 +107,21 @@ The e2e script auto-resolves all required values:
 - `MODEL_PRIMARY` — from `.env.local`
 - `tgcli sync` — runs automatically before first send
 
-What the Telegram e2e tests cover (9 assertions):
+What the Telegram e2e tests cover:
+
+**AI round-trip tests (tests 1–3):**
 
 1. **Text round-trip** — send text, verify inbound forwarding + AI reply
 2. **Photo round-trip** — send image, verify inbound forwarding + AI reply
 3. **Multi-action round-trip** — one prompt triggers sendMessage + sendDocument + setMessageReaction
+
+**Transport-only tests (tests 4–9, no AI — fast, no LLM cost):**
+
 4. **File proxy** — verify mux file proxy returns 200 with content
+5. **argsMenu inline buttons** — send `/reasoning`, verify outbound sendMessage contains `reply_markup`
+6. **Sticker inbound** — send sticker, verify mux-server forwards it (skips if no sticker packs in tgcli)
+7. **Document inbound** — send text file, verify mux-server forwards it
+8. **Threaded mode (forum topics)** — create topic in bot DM, send `/reasoning` in it, verify `message_thread_id` preserved in outbound, then delete topic
 
 ## Smoke Flow (Manual)
 
