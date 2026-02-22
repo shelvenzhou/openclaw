@@ -3,6 +3,13 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { resolveAckReaction } from "../agents/identity.js";
+import {
+  buildCommandTextFromArgs,
+  findCommandByNativeName,
+  parseCommandArgs,
+  resolveCommandArgMenu,
+} from "../auto-reply/commands-registry.js";
+import type { CommandArgs } from "../auto-reply/commands-registry.types.js";
 import { dispatchInboundMessage } from "../auto-reply/dispatch.js";
 import { dispatchReplyWithBufferedBlockDispatcher } from "../auto-reply/reply/provider-dispatcher.js";
 import { createReplyDispatcher } from "../auto-reply/reply/reply-dispatcher.js";
@@ -548,6 +555,44 @@ async function dispatchMuxTelegram(params: {
   );
 
   const mux: MuxTransportOpts = { cfg, sessionKey, accountId: ctx.AccountId };
+
+  // Mirror direct-path command menu interception (bot-native-commands.ts:510-540).
+  // When a command has argsMenu: "auto" and no args are provided, send inline
+  // keyboard buttons and return early — identical to what the grammY handler does.
+  const body = (ctx.Body ?? "").trim();
+  const commandMatch = body.match(/^\/([a-z0-9_]+)(?:@\S+)?\s*(.*)/i);
+  if (commandMatch) {
+    const [, commandName, rawArgs] = commandMatch;
+    const commandDef = findCommandByNativeName(commandName, "telegram");
+    if (commandDef) {
+      const commandArgs = parseCommandArgs(commandDef, rawArgs.trim());
+      const menu = resolveCommandArgMenu({ command: commandDef, args: commandArgs, cfg });
+      if (menu) {
+        const title =
+          menu.title ??
+          `Choose ${menu.arg.description || menu.arg.name} for /${commandDef.nativeName ?? commandDef.key}.`;
+        const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+        for (let i = 0; i < menu.choices.length; i += 2) {
+          rows.push(
+            menu.choices.slice(i, i + 2).map((choice) => {
+              const args: CommandArgs = { values: { [menu.arg.name]: choice.value } };
+              return {
+                text: choice.label,
+                callback_data: buildCommandTextFromArgs(commandDef, args),
+              };
+            }),
+          );
+        }
+        await sendMessageTelegram(originatingTo, title, {
+          textMode: "html",
+          messageThreadId,
+          buttons: rows,
+          mux,
+        });
+        return;
+      }
+    }
+  }
 
   const transport: TelegramDraftStreamTransport = {
     send: async (text) => {
