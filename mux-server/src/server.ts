@@ -211,6 +211,11 @@ type WhatsAppRuntimeHealth = {
   lastInboundSeenAtMs: number | null;
 };
 
+type TelegramPollConflictHealth = {
+  lastConflictAtMs: number;
+  lastError: string;
+};
+
 type WebRuntimeModules = {
   monitorWebInbox: (options: {
     verbose: boolean;
@@ -973,6 +978,7 @@ const whatsappRuntimeHealth: WhatsAppRuntimeHealth = {
   lastListenerError: null,
   lastInboundSeenAtMs: null,
 };
+let telegramPollConflictHealth: TelegramPollConflictHealth | null = null;
 
 function hashApiKey(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -4425,6 +4431,35 @@ async function fetchTelegramUpdates(offset: number): Promise<TelegramUpdate[]> {
   return json.result as TelegramUpdate[];
 }
 
+function resolveTelegramGetUpdatesStatusCode(errorText: string): number | null {
+  const match = errorText.match(/telegram(?: bootstrap)? getUpdates failed \((\d{3})\)/i);
+  if (!match) {
+    return null;
+  }
+  const parsed = Number.parseInt(match[1] ?? "", 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
+function updateTelegramPollConflictHealth(error: unknown) {
+  const errorText = String(error);
+  const statusCode = resolveTelegramGetUpdatesStatusCode(errorText);
+  if (statusCode === 409) {
+    telegramPollConflictHealth = {
+      lastConflictAtMs: Date.now(),
+      lastError: errorText,
+    };
+    return;
+  }
+  telegramPollConflictHealth = null;
+}
+
+function clearTelegramPollConflictHealth() {
+  telegramPollConflictHealth = null;
+}
+
 async function bootstrapTelegramOffsetIfNeeded() {
   if (!telegramBootstrapLatest) {
     return;
@@ -6386,7 +6421,9 @@ async function runTelegramInboundLoop() {
 
   try {
     await bootstrapTelegramOffsetIfNeeded();
+    clearTelegramPollConflictHealth();
   } catch (error) {
+    updateTelegramPollConflictHealth(error);
     log({ type: "telegram_inbound_bootstrap_error", error: String(error) });
   }
 
@@ -6402,6 +6439,7 @@ async function runTelegramInboundLoop() {
     try {
       const offset = resolveStoredTelegramOffset() + 1;
       const updates = await fetchTelegramUpdates(offset);
+      clearTelegramPollConflictHealth();
       for (const update of updates) {
         const updateId =
           typeof update.update_id === "number" && Number.isFinite(update.update_id)
@@ -6425,6 +6463,7 @@ async function runTelegramInboundLoop() {
         }
       }
     } catch (error) {
+      updateTelegramPollConflictHealth(error);
       log({ type: "telegram_inbound_poll_error", error: String(error) });
       await new Promise((resolveSleep) =>
         setTimeout(resolveSleep, Math.max(100, Math.trunc(telegramPollRetryMs))),
@@ -6439,9 +6478,19 @@ const server = http.createServer(async (req, res) => {
     const pathname = requestUrl.pathname;
 
     if (pathname === "/health") {
+      const telegramInboundHealth = telegramPollConflictHealth
+        ? {
+            status: "degraded",
+            code: "poll_conflict",
+            message: "Telegram getUpdates returned 409; another poller is using this bot token.",
+            lastConflictAtMs: telegramPollConflictHealth.lastConflictAtMs,
+            lastError: telegramPollConflictHealth.lastError,
+          }
+        : undefined;
       sendJson(res, 200, {
         ok: true,
         ...(telegramBotUsername ? { telegramBotUsername } : {}),
+        ...(telegramInboundHealth ? { telegramInbound: telegramInboundHealth } : {}),
       });
       return;
     }

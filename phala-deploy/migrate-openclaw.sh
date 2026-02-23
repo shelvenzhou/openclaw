@@ -6,7 +6,7 @@
 # Each migration checks the config first and skips if already applied.
 #
 # Usage:
-#   rv-exec COMPOSEIO_ADMIN_API -- bash phala-deploy/migrate-openclaw.sh <CVM_ID>
+#   COMPOSEIO_ADMIN_API=... bash phala-deploy/migrate-openclaw.sh <CVM>
 #
 # Migrations:
 #   composio   — if COMPOSEIO_ADMIN_API is set and config is missing
@@ -18,16 +18,16 @@ log()  { printf '\033[1;34m[migrate]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[migrate] ✓\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[migrate] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
-CVM_ID=""
+CVM=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) sed -n '2,/^[^#]/{ /^#/s/^# \?//p }' "$0"; exit 0 ;;
     -*) die "unknown option: $1" ;;
-    *)  CVM_ID="$1"; shift ;;
+    *)  CVM="$1"; shift ;;
   esac
 done
 
-[[ -n "$CVM_ID" ]] || die "usage: migrate-openclaw.sh <CVM_ID>"
+[[ -n "$CVM" ]] || die "usage: migrate-openclaw.sh <CVM>"
 
 REMOTE_CFG="/root/.openclaw/openclaw.json"
 REMOTE_TMP="/tmp/openclaw.json"
@@ -36,10 +36,10 @@ trap 'rm -f "$LOCAL_TMP"' EXIT
 
 # ── download openclaw.json ──────────────────────────────────────────────────
 
-log "Downloading openclaw.json from CVM ${CVM_ID}..."
-phala ssh "$CVM_ID" -- docker cp "openclaw:${REMOTE_CFG}" "$REMOTE_TMP" \
+log "Downloading openclaw.json from CVM ${CVM}..."
+phala ssh "$CVM" -- docker cp "openclaw:${REMOTE_CFG}" "$REMOTE_TMP" \
   || die "docker cp from container failed"
-phala cp "${CVM_ID}:${REMOTE_TMP}" "$LOCAL_TMP" \
+phala cp "${CVM}:${REMOTE_TMP}" "$LOCAL_TMP" \
   || die "phala cp download failed"
 ok "Downloaded openclaw.json ($(wc -c < "$LOCAL_TMP") bytes)"
 
@@ -131,9 +131,9 @@ if [[ "$CHECKSUM_BEFORE" == "$CHECKSUM_AFTER" ]]; then
 fi
 
 log "Uploading openclaw.json to CVM..."
-phala cp "$LOCAL_TMP" "${CVM_ID}:${REMOTE_TMP}" \
+phala cp "$LOCAL_TMP" "${CVM}:${REMOTE_TMP}" \
   || die "phala cp upload failed"
-phala ssh "$CVM_ID" -- docker cp "${REMOTE_TMP}" "openclaw:${REMOTE_CFG}" \
+phala ssh "$CVM" -- docker cp "${REMOTE_TMP}" "openclaw:${REMOTE_CFG}" \
   || die "docker cp into container failed"
 
-ok "Done — openclaw.json migrated on CVM ${CVM_ID}"
+ok "Done — openclaw.json migrated on CVM ${CVM}"
