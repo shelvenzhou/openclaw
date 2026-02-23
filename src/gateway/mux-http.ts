@@ -15,6 +15,7 @@ import { dispatchReplyWithBufferedBlockDispatcher } from "../auto-reply/reply/pr
 import { createReplyDispatcher } from "../auto-reply/reply/reply-dispatcher.js";
 import { routeReply } from "../auto-reply/reply/route-reply.js";
 import type { MsgContext } from "../auto-reply/templating.js";
+import { shouldAckReaction, type AckReactionScope } from "../channels/ack-reactions.js";
 import { normalizeChannelId } from "../channels/plugins/index.js";
 import {
   asMuxRecord,
@@ -410,6 +411,7 @@ export async function handleMuxInboundHttpRequest(
     OriginatingChannel: channel,
     OriginatingTo: originatingTo,
     MessageThreadId: resolveMuxThreadId(payload.threadId, channelData),
+    WasMentioned: payload.wasMentioned === true,
     ChannelData: {
       ...channelData,
       ...(isTelegramStreaming ? { inboundTransport: "mux" } : {}),
@@ -645,13 +647,31 @@ async function dispatchMuxTelegram(params: {
     warn: logVerbose,
   });
 
-  // Fire-and-forget ack reaction (same gate as direct path).
-  const ackEmoji = resolveAckReaction(cfg, "default", {
-    channel: "telegram",
-    accountId: ctx.AccountId,
-  });
-  if (ackEmoji) {
-    void reactMessageTelegram(originatingTo, Number(messageId), ackEmoji, { mux }).catch(() => {});
+  // Fire-and-forget ack reaction — gated by ackReactionScope (same policy as direct path).
+  const ackScope = (cfg.messages?.ackReactionScope ?? "group-mentions") as AckReactionScope;
+  const isDirect = ctx.ChatType === "direct";
+  const isGroup = !isDirect;
+  if (
+    shouldAckReaction({
+      scope: ackScope,
+      isDirect,
+      isGroup,
+      isMentionableGroup: isGroup,
+      requireMention: true,
+      canDetectMention: true,
+      effectiveWasMentioned: ctx.WasMentioned === true,
+      shouldBypassMention: false,
+    })
+  ) {
+    const ackEmoji = resolveAckReaction(cfg, "default", {
+      channel: "telegram",
+      accountId: ctx.AccountId,
+    });
+    if (ackEmoji) {
+      void reactMessageTelegram(originatingTo, Number(messageId), ackEmoji, { mux }).catch(
+        () => {},
+      );
+    }
   }
 
   let markDispatchIdle: (() => void) | undefined;

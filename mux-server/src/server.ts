@@ -280,8 +280,10 @@ type TelegramIncomingMessage = {
   document?: TelegramDocument;
   video?: TelegramVideo;
   animation?: TelegramAnimation;
-  from?: { id?: number };
+  from?: { id?: number; username?: string };
   chat?: { id?: number; type?: string; is_forum?: boolean };
+  entities?: Array<{ type?: string; offset?: number; length?: number }>;
+  reply_to_message?: { from?: { username?: string } };
 };
 
 type TelegramPhotoSize = {
@@ -514,7 +516,7 @@ const whatsappQueueRetryMaxMs = Number(process.env.MUX_WHATSAPP_QUEUE_RETRY_MAX_
 const whatsappQueueBatchSize = Number(process.env.MUX_WHATSAPP_QUEUE_BATCH_SIZE || 20);
 const pairingTokenTtlSec = Number(process.env.MUX_PAIRING_TOKEN_TTL_SEC || 15 * 60);
 const pairingTokenMaxTtlSec = Number(process.env.MUX_PAIRING_TOKEN_MAX_TTL_SEC || 60 * 60);
-const telegramBotUsername = readNonEmptyString(process.env.MUX_TELEGRAM_BOT_USERNAME);
+let telegramBotUsername = readNonEmptyString(process.env.MUX_TELEGRAM_BOT_USERNAME);
 const pairingSuccessTextOverride = readNonEmptyString(process.env.MUX_PAIRING_SUCCESS_TEXT);
 const pairingInvalidTextOverride = readNonEmptyString(process.env.MUX_PAIRING_INVALID_TEXT);
 const botControlHelpTextOverride = readNonEmptyString(process.env.MUX_BOT_HELP_TEXT);
@@ -5184,6 +5186,25 @@ async function forwardTelegramUpdateToTenant(update: TelegramUpdate) {
     Date.now(),
   );
 
+  // Compute wasMentioned: check for @botUsername entity or reply-to-bot.
+  let wasMentioned = false;
+  const botUsername = telegramBotUsername;
+  if (botUsername) {
+    const entities = Array.isArray(message.entities) ? message.entities : [];
+    wasMentioned = entities.some(
+      (e: { type?: string; offset?: number; length?: number }) =>
+        e.type === "mention" &&
+        typeof e.offset === "number" &&
+        typeof e.length === "number" &&
+        (forwardedBody ?? "").slice(e.offset, e.offset + e.length).toLowerCase() ===
+          `@${botUsername.toLowerCase()}`,
+    );
+    if (!wasMentioned && message.reply_to_message?.from?.username) {
+      wasMentioned =
+        message.reply_to_message.from.username.toLowerCase() === botUsername.toLowerCase();
+    }
+  }
+
   const payload = buildTelegramInboundEnvelope({
     updateId,
     sessionKey,
@@ -5200,6 +5221,7 @@ async function forwardTelegramUpdateToTenant(update: TelegramUpdate) {
     rawUpdate: update,
     media: inboundMedia.media,
     attachments: inboundMedia.attachments,
+    wasMentioned,
   });
   const payloadWithIdentity = {
     ...payload,
@@ -6417,7 +6439,10 @@ const server = http.createServer(async (req, res) => {
     const pathname = requestUrl.pathname;
 
     if (pathname === "/health") {
-      sendJson(res, 200, { ok: true });
+      sendJson(res, 200, {
+        ok: true,
+        ...(telegramBotUsername ? { telegramBotUsername } : {}),
+      });
       return;
     }
 
@@ -7190,7 +7215,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(port, host, () => {
+server.listen(port, host, async () => {
   const tenantTargetCount = countActiveTenantInboundTargets();
   log({
     type: "relay_started",
@@ -7216,6 +7241,25 @@ server.listen(port, host, () => {
     });
   }
   if (telegramInboundEnabled) {
+    // Auto-resolve bot username via getMe if not provided via env.
+    if (!telegramBotUsername && telegramBotToken) {
+      try {
+        const getMeRes = await fetch(`https://api.telegram.org/bot${telegramBotToken}/getMe`, {
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (getMeRes.ok) {
+          const getMeData = (await getMeRes.json()) as {
+            result?: { username?: string };
+          };
+          const resolved = getMeData?.result?.username;
+          if (resolved) {
+            telegramBotUsername = resolved;
+          }
+        }
+      } catch {
+        // Best-effort — wasMentioned will stay false without it.
+      }
+    }
     log({
       type: "telegram_inbound_started",
       tenantTargetCount,
@@ -7223,6 +7267,7 @@ server.listen(port, host, () => {
       pollTimeoutSec: Math.max(1, Math.trunc(telegramPollTimeoutSec)),
       pollRetryMs: Math.max(100, Math.trunc(telegramPollRetryMs)),
       bootstrapLatest: telegramBootstrapLatest,
+      botUsername: telegramBotUsername ?? null,
     });
     void runTelegramInboundLoop().catch((error) => {
       log({ type: "telegram_inbound_loop_fatal", error: String(error) });

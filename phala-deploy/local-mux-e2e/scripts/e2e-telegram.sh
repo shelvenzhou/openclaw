@@ -382,7 +382,7 @@ if [[ -n "${e2e_openclaw_id}" ]]; then
   runtime_token="$(echo "${register_response}" | jq -r '.runtimeToken // empty')" || true
 fi
 
-user_chat_id="$(compose exec -T mux-server grep -oP '"telegram_pairing_token_claimed".*"routeKey":"telegram:default:chat:\K[0-9]+' \
+user_chat_id="$(compose exec -T mux-server grep -oP '"telegram_pairing_token_(claimed|ignored_bound_route)".*"routeKey":"telegram:default:chat:\K[0-9]+' \
   "${MUX_LOG}" 2>/dev/null | tail -1)" || true
 
 file_id=""
