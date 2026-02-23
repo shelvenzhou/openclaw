@@ -7,11 +7,14 @@
 #
 # Usage:
 #   COMPOSEIO_ADMIN_API=... bash phala-deploy/migrate-openclaw.sh <CVM>
+#   COMPOSEIO_ADMIN_API=... bash phala-deploy/migrate-openclaw.sh --dry-run <CVM>
 #
 # Migrations:
 #   composio   — if COMPOSEIO_ADMIN_API is set and config is missing
 #                COMPOSIO_MCP_URL, creates a Tool Router session and
 #                injects COMPOSIO_MCP_URL + COMPOSIO_API_KEY
+#   codex      — if CODEX_API_ENDPOINT + CODEX_API_KEY are set, migrates legacy
+#                openai codex provider config to openai-codex
 set -euo pipefail
 
 log()  { printf '\033[1;34m[migrate]\033[0m %s\n' "$*"; }
@@ -19,9 +22,11 @@ ok()   { printf '\033[1;32m[migrate] ✓\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[migrate] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 CVM=""
+DRY_RUN=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) sed -n '2,/^[^#]/{ /^#/s/^# \?//p }' "$0"; exit 0 ;;
+    --dry-run) DRY_RUN=1; shift ;;
     -*) die "unknown option: $1" ;;
     *)  CVM="$1"; shift ;;
   esac
@@ -119,6 +124,86 @@ else
   log "Migration: brave-search — skipped (no BRAVE_SEARCH_API_KEY)"
 fi
 
+# --- Migration: openai-codex provider ---
+if [[ -n "${CODEX_API_ENDPOINT:-}" && -n "${CODEX_API_KEY:-}" ]]; then
+  CODEX_BASE_URL="${CODEX_API_ENDPOINT%/}"
+  [[ "$CODEX_BASE_URL" == */v1 ]] || die "CODEX_API_ENDPOINT must end with /v1 (got: ${CODEX_API_ENDPOINT})"
+  log "Migration: codex-provider..."
+  CODEX_BASE_URL="$CODEX_BASE_URL" \
+  CODEX_REAL_API_KEY="${CODEX_API_KEY}" \
+  CODEX_MOCK_JWT="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9zdWIyYXBpX3Byb3h5In0sImV4cCI6OTk5OTk5OTk5OX0.c3ViMmFwaQ" \
+  node -e '
+    const fs = require("fs");
+
+    function main() {
+      const cfgPath = process.argv[1];
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+      const providers = cfg.models?.providers;
+      const codexBaseUrl = process.env.CODEX_BASE_URL;
+      const codexApiKey = process.env.CODEX_REAL_API_KEY;
+      let changed = false;
+
+      if (!providers) {
+        console.log("  codex-provider: no providers block, skipping.");
+        return;
+      }
+
+      const old = providers["openai"];
+      if (old) {
+        providers["openai-codex"] = {
+          baseUrl: codexBaseUrl,
+          apiKey: process.env.CODEX_MOCK_JWT,
+          headers: { "x-api-key": codexApiKey },
+          models: old.models || [],
+        };
+        delete providers["openai"];
+        changed = true;
+        console.log("  codex-provider: migrated (openai -> openai-codex)");
+      }
+
+      const codex = providers["openai-codex"];
+      if (codex) {
+        if (codex.baseUrl !== codexBaseUrl) {
+          codex.baseUrl = codexBaseUrl;
+          changed = true;
+          console.log("  codex-provider: normalized baseUrl");
+        }
+        if (!codex.headers || typeof codex.headers !== "object") {
+          codex.headers = {};
+        }
+        if (codex.headers["x-api-key"] !== codexApiKey) {
+          codex.headers["x-api-key"] = codexApiKey;
+          changed = true;
+          console.log("  codex-provider: updated x-api-key header");
+        }
+      }
+
+      const defaults = cfg.agents?.defaults;
+      if (defaults?.models?.["openai/gpt-5.2-codex"]) {
+        defaults.models["openai-codex/gpt-5.3-codex"] = { alias: "Codex" };
+        delete defaults.models["openai/gpt-5.2-codex"];
+        changed = true;
+      }
+      if (defaults?.model?.primary === "openai/gpt-5.2-codex") {
+        defaults.model.primary = "openai-codex/gpt-5.3-codex";
+        changed = true;
+      }
+
+      if (!changed) {
+        console.log("  codex-provider: already up to date, skipping.");
+        return;
+      }
+
+      fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+      console.log("  codex-provider: updated");
+    }
+
+    main();
+  ' "$LOCAL_TMP" || die "codex-provider migration failed"
+else
+  log "Migration: codex-provider — skipped (CODEX_API_ENDPOINT/CODEX_API_KEY not set)"
+fi
+
 # --- (future migrations go here) ---
 
 # ── upload if changed ───────────────────────────────────────────────────────
@@ -127,6 +212,11 @@ CHECKSUM_AFTER=$(md5sum "$LOCAL_TMP" | cut -d' ' -f1)
 
 if [[ "$CHECKSUM_BEFORE" == "$CHECKSUM_AFTER" ]]; then
   ok "No changes — config already up to date."
+  exit 0
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  ok "Dry-run: migration would update config on CVM ${CVM}; skipping upload."
   exit 0
 fi
 
