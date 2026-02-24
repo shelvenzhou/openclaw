@@ -180,11 +180,13 @@ EOF_ENV
   chmod 600 "$DEPLOY_ENV_FILE"
 
   if (( DRY_RUN )); then
-    log "[dry-run] phala deploy --cvm-id $MUX_CVM -c $COMPOSE_FILE -e $DEPLOY_ENV_FILE"
+    log "[dry-run] phala deploy --cvm-id $MUX_CVM -c $COMPOSE_FILE -e $DEPLOY_ENV_FILE --wait"
     return 0
   fi
 
   phala deploy --cvm-id "$MUX_CVM" -c "$COMPOSE_FILE" -e "$DEPLOY_ENV_FILE"
+  log "Compose updated. Waiting 30s for CVM reboot and image pull..."
+  sleep 30
 }
 
 # ── wait for health ──────────────────────────────────────────────────────────

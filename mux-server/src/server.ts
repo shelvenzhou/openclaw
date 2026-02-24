@@ -726,14 +726,8 @@ const stmtInsertPairingToken = db.prepare(`
 const stmtSelectActivePairingTokenByHash = db.prepare(`
   SELECT tenant_id, channel, session_key
   FROM pairing_tokens
-  WHERE token_hash = ? AND consumed_at_ms IS NULL AND expires_at_ms > ?
+  WHERE token_hash = ? AND expires_at_ms > ?
   LIMIT 1
-`);
-
-const stmtConsumePairingToken = db.prepare(`
-  UPDATE pairing_tokens
-  SET consumed_at_ms = ?
-  WHERE token_hash = ? AND consumed_at_ms IS NULL AND expires_at_ms > ?
 `);
 
 const stmtAttachPairingTokenBinding = db.prepare(`
@@ -1332,7 +1326,7 @@ function initializeDatabase(database: DatabaseSync) {
     CREATE TABLE IF NOT EXISTS pairing_tokens (
       token_hash TEXT PRIMARY KEY,
       tenant_id TEXT NOT NULL,
-      channel TEXT NOT NULL,
+      channel TEXT,
       session_key TEXT,
       created_at_ms INTEGER NOT NULL,
       expires_at_ms INTEGER NOT NULL,
@@ -1438,6 +1432,7 @@ function ensureTenantInboundTargetColumns(database: DatabaseSync) {
 function ensurePairingTokenColumns(database: DatabaseSync) {
   const rows = database.prepare("PRAGMA table_info(pairing_tokens)").all() as Array<{
     name?: unknown;
+    notnull?: unknown;
   }>;
   const columnNames = new Set(rows.map((row) => (typeof row.name === "string" ? row.name : "")));
   if (!columnNames.has("consumed_binding_id")) {
@@ -1445,6 +1440,27 @@ function ensurePairingTokenColumns(database: DatabaseSync) {
   }
   if (!columnNames.has("consumed_route_key")) {
     database.exec("ALTER TABLE pairing_tokens ADD COLUMN consumed_route_key TEXT");
+  }
+
+  // Migrate channel column from NOT NULL to nullable (channel-agnostic tokens)
+  const channelCol = rows.find((r) => typeof r.name === "string" && r.name === "channel");
+  if (channelCol && channelCol.notnull === 1) {
+    database.exec(`
+      ALTER TABLE pairing_tokens RENAME TO pairing_tokens_old;
+      CREATE TABLE pairing_tokens (
+        token_hash TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        channel TEXT,
+        session_key TEXT,
+        created_at_ms INTEGER NOT NULL,
+        expires_at_ms INTEGER NOT NULL,
+        consumed_at_ms INTEGER,
+        consumed_binding_id TEXT,
+        consumed_route_key TEXT
+      );
+      INSERT INTO pairing_tokens SELECT * FROM pairing_tokens_old;
+      DROP TABLE pairing_tokens_old;
+    `);
   }
 }
 
@@ -2205,7 +2221,8 @@ function normalizeTtlSec(ttlSec: number): number {
 }
 
 function generatePairingToken(): string {
-  return `mpt_${randomBytes(24).toString("base64url")}`;
+  // Use hex instead of base64url to avoid underscores, which Discord renders as italic Markdown.
+  return `mpt_${randomBytes(24).toString("hex")}`;
 }
 
 function hashPairingToken(token: string): string {
@@ -2241,21 +2258,10 @@ function runTokenClaimTransaction<T>(claim: () => T | null): T | null {
 
 function issuePairingTokenForTenant(params: {
   tenant: TenantIdentity;
-  channel: string;
+  channel: string | null;
   sessionKey?: string;
   ttlSec?: number;
 }) {
-  if (
-    params.channel !== "telegram" &&
-    params.channel !== "discord" &&
-    params.channel !== "whatsapp"
-  ) {
-    return {
-      statusCode: 400,
-      payload: { ok: false, error: "unsupported channel for token pairing" },
-    };
-  }
-
   const nowMs = Date.now();
   purgeExpiredPairingTokens(nowMs);
   const ttlSec = normalizeTtlSec(params.ttlSec ?? pairingTokenTtlSec);
@@ -2283,10 +2289,16 @@ function issuePairingTokenForTenant(params: {
     expiresAtMs,
   );
 
+  // Build deep links: for channel-agnostic tokens, include all available platforms
+  const telegramDeepLink = telegramBotUsername
+    ? `https://t.me/${telegramBotUsername}?start=${encodeURIComponent(token)}`
+    : null;
   const deepLink =
-    params.channel === "telegram" && telegramBotUsername
-      ? `https://t.me/${telegramBotUsername}?start=${encodeURIComponent(token)}`
-      : null;
+    params.channel === null
+      ? telegramDeepLink
+      : params.channel === "telegram"
+        ? telegramDeepLink
+        : null;
 
   writeAuditLog(
     params.tenant.id,
@@ -2306,7 +2318,8 @@ function issuePairingTokenForTenant(params: {
       channel: params.channel,
       token,
       expiresAtMs,
-      startCommand: params.channel === "telegram" ? `/start ${token}` : null,
+      startCommand:
+        params.channel === null || params.channel === "telegram" ? `/start ${token}` : null,
       deepLink,
     },
   };
@@ -3543,13 +3556,13 @@ function renderBotStatusNotice(params: {
 
 function peekActivePairingToken(
   token: string,
-  channel: "telegram" | "discord" | "whatsapp",
+  _channel?: "telegram" | "discord" | "whatsapp",
 ): PairingTokenRow | null {
   const now = Date.now();
   purgeExpiredPairingTokens(now);
   const tokenHash = hashPairingToken(token);
   const row = stmtSelectActivePairingTokenByHash.get(tokenHash, now) as PairingTokenRow | undefined;
-  if (!row || String(row.channel) !== channel) {
+  if (!row) {
     return null;
   }
   return row;
@@ -3641,7 +3654,7 @@ function claimTelegramPairingToken(params: {
     const row = stmtSelectActivePairingTokenByHash.get(tokenHash, now) as
       | PairingTokenRow
       | undefined;
-    if (!row || String(row.channel) !== "telegram") {
+    if (!row) {
       return null;
     }
 
@@ -3700,11 +3713,6 @@ function claimTelegramPairingToken(params: {
       now,
     );
 
-    const consumeResult = stmtConsumePairingToken.run(now, tokenHash, now);
-    if (consumeResult.changes === 0) {
-      return null;
-    }
-
     stmtAttachPairingTokenBinding.run(bindingId, boundRouteKey, tokenHash);
     writeAuditLog(tenantId, "pairing_token_claimed", { bindingId, routeKey: boundRouteKey }, now);
     return { tenantId, bindingId, routeKey: boundRouteKey, sessionKey };
@@ -3723,7 +3731,7 @@ function claimDiscordPairingToken(params: {
     const row = stmtSelectActivePairingTokenByHash.get(tokenHash, now) as
       | PairingTokenRow
       | undefined;
-    if (!row || String(row.channel) !== "discord") {
+    if (!row) {
       return null;
     }
     const tenantId = String(row.tenant_id);
@@ -3828,11 +3836,6 @@ function claimDiscordPairingToken(params: {
       now,
     );
 
-    const consumeResult = stmtConsumePairingToken.run(now, tokenHash, now);
-    if (consumeResult.changes === 0) {
-      return null;
-    }
-
     stmtAttachPairingTokenBinding.run(bindingId, boundRouteKey, tokenHash);
     writeAuditLog(tenantId, "pairing_token_claimed", { bindingId, routeKey: boundRouteKey }, now);
     return {
@@ -3858,7 +3861,7 @@ function claimWhatsAppPairingToken(params: {
     const row = stmtSelectActivePairingTokenByHash.get(tokenHash, now) as
       | PairingTokenRow
       | undefined;
-    if (!row || String(row.channel) !== "whatsapp") {
+    if (!row) {
       return null;
     }
 
@@ -3912,11 +3915,6 @@ function claimWhatsAppPairingToken(params: {
       }),
       now,
     );
-
-    const consumeResult = stmtConsumePairingToken.run(now, tokenHash, now);
-    if (consumeResult.changes === 0) {
-      return null;
-    }
 
     stmtAttachPairingTokenBinding.run(bindingId, routeKey, tokenHash);
     writeAuditLog(tenantId, "pairing_token_claimed", { bindingId, routeKey }, now);
@@ -6548,10 +6546,6 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const channel = normalizeChannel(body.channel);
-      if (!channel) {
-        sendJson(res, 400, { ok: false, error: "channel required" });
-        return;
-      }
       const sessionKey = readNonEmptyString(body.sessionKey) ?? undefined;
       const ttlSec = readPositiveInt(body.ttlSec);
 
