@@ -1,0 +1,34 @@
+{
+  "id": "mentat-bridge",
+  "kind": "memory",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "Base URL of the Mentat sidecar HTTP server"
+      },
+      "timeoutMs": {
+        "type": "number",
+        "minimum": 1000,
+        "description": "Connection and read timeout in ms"
+      },
+      "autoIndexTools": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Auto-index tool results from these tool names (glob patterns)"
+      },
+      "minContentLength": {
+        "type": "number",
+        "minimum": 0,
+        "description": "Minimum content length (chars) to index"
+      },
+      "maxContentLength": {
+        "type": "number",
+        "minimum": 1,
+        "description": "Maximum content length (chars) per index request"
+      }
+    }
+  }
+}
